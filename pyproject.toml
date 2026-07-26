@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "local-pdf-translator"
+version = "0.1.0"
+description = "Local-first English PDF to Chinese translation workflow using manual Google Translate XLSX round trips."
+readme = "README.md"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "openpyxl>=3.1,<4",
+  "Pillow>=10,<13",
+  "PyMuPDF>=1.24,<2",
+  "pypdf>=5,<7",
+  "reportlab>=4.2,<5",
+  "Flask>=3.1,<4",
+  "numpy>=1.26,<3",
+  "opencv-python-headless>=4.10,<5",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8,<10",
+  "pytest-cov>=5,<8",
+]
+
+[project.scripts]
+pdf-translator = "pdf_translator.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+pdf_translator = [
+  "assets/*.swift",
+  "templates/*.html",
+  "static/*.css",
+  "static/*.js",
+  "static/*.svg",
+]
+
+[tool.pytest.ini_options]
+addopts = "-q"
+testpaths = ["tests"]
+pythonpath = ["src", "."]

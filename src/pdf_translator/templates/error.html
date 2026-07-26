@@ -1,0 +1,8 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="panel error-page">
+  <p class="eyebrow">无法继续</p>
+  <h1>{{ message }}</h1>
+  <a class="button primary" href="{{ url_for('index') }}">返回任务列表</a>
+</section>
+{% endblock %}

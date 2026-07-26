@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block content %}
+<section class="hero">
+  <div>
+    <p class="eyebrow">PDF → 中文 · 本地优先</p>
+    <h1>保留原版面，把英文 PDF 转成中文</h1>
+    <p class="lede">选择本地 PDF 和页码范围，程序会识别文字并生成翻译包；把 Google Translate 返回的 XLSX 导入后，即可在原页面位置生成中文版 PDF。原 PDF 和图片始终留在本机。</p>
+  </div>
+</section>
+
+<div class="home-grid">
+  <section class="panel">
+    <div class="section-title">
+      <span class="step-number">1</span>
+      <div><h2>新建任务</h2><p>建议先用少量页面验证 OCR 与阅读顺序。</p></div>
+    </div>
+    <form action="{{ url_for('analyze') }}" method="post" class="job-form" data-job-form data-kind="analyze" data-analysis-form>
+      <div class="path-picker">
+        <label>本地 PDF 绝对路径
+          <input name="source_path" type="text" required placeholder="/Users/you/Downloads/book.pdf" autocomplete="off" data-source-path>
+        </label>
+        <button class="button secondary" type="button" data-select-pdf>选择 PDF 文件</button>
+      </div>
+      <p class="field-hint" data-path-status>可以点击选择，也可以粘贴带单引号或双引号的路径。</p>
+      <div class="field-grid">
+        <label>开始页
+          <input name="page_start" type="number" min="1" step="1" value="1" required data-page-start>
+        </label>
+        <label>结束页
+          <input name="page_end" type="number" min="1" step="1" placeholder="留空表示最后一页" data-page-end>
+        </label>
+      </div>
+      <div class="pdf-inspection" data-pdf-inspection hidden>
+        <strong data-inspection-title>PDF 快速检查</strong>
+        <span data-inspection-meta></span>
+        <p data-inspection-message></p>
+      </div>
+      <div class="field-grid">
+        <label>文字识别
+          <select name="ocr_mode" data-ocr-mode>
+            <option value="vision" selected>自动识别（推荐）</option>
+            <option value="off">仅使用 PDF 文字层（最快）</option>
+          </select>
+          <small class="field-note" data-ocr-mode-hint>自动模式会直接读取正常文字页，只对没有文字层的页面运行本地 Vision OCR。</small>
+        </label>
+        <label data-ocr-dpi-field>OCR 清晰度
+          <select name="ocr_dpi" data-ocr-dpi>
+            <option value="150">150 DPI · 更快</option>
+            <option value="180" selected>180 DPI · 推荐</option>
+            <option value="240">240 DPI · 小字</option>
+          </select>
+          <small class="field-note" data-ocr-dpi-hint>仅在图片页面需要 OCR 时生效。</small>
+        </label>
+      </div>
+      <button class="button primary wide" type="submit">开始分析</button>
+      <div class="job-progress" hidden>
+        <div class="progress-copy"><span data-job-message>准备中</span><span data-job-percent>0%</span></div>
+        <div class="progress-track"><span data-job-bar></span></div>
+        <p class="form-error" data-job-error></p>
+      </div>
+      <div class="job-recovery callout warning" data-job-recovery hidden>
+        <strong>所选页面没有可用文字层</strong>
+        <p data-recovery-message>可以切换到自动识别，由本地 Vision OCR 处理图片页面。</p>
+        <button class="button primary" type="button" data-retry-vision>改用自动识别并重新分析</button>
+      </div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="section-title">
+      <span class="step-number muted">↺</span>
+      <div><h2>历史任务</h2><p>{{ tasks|length }} 个任务保存在本机。</p></div>
+    </div>
+    <div class="task-list">
+      {% for task in tasks %}
+        <a class="task-card" href="{{ url_for('task_detail', task_id=task.task_id) }}">
+          <div>
+            <strong>{{ task.source_filename }}</strong>
+            <span>{{ task.page_range_label }} · {{ task.source_size_bytes|filesize }}</span>
+          </div>
+          <em>{{ status_labels.get(task.status, task.status) }}</em>
+        </a>
+      {% else %}
+        <div class="empty-state">还没有任务。填入左侧路径即可开始。</div>
+      {% endfor %}
+    </div>
+    <p class="data-path">数据目录<br><code>{{ data_dir }}</code></p>
+  </section>
+</div>
+{% endblock %}

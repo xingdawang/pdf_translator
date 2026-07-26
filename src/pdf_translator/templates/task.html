@@ -1,0 +1,141 @@
+{% extends "base.html" %}
+{% block title %}{{ task.source_filename }} · 本地 PDF 英译中{% endblock %}
+{% block topbar_nav %}
+<nav class="workflow-nav" aria-label="任务步骤">
+  <a href="#export" data-workflow-link="export">导出翻译包</a>
+  <a href="#google" data-workflow-link="google">Google Translate</a>
+  <a href="#import" data-workflow-link="import">导入翻译件</a>
+  <a href="#generate" data-workflow-link="generate">生成结果</a>
+</nav>
+{% endblock %}
+{% block content %}
+<div class="task-heading">
+  <div>
+    <a class="back-link" href="{{ url_for('index') }}">← 返回任务列表</a>
+    <h1>{{ task.source_filename }}</h1>
+    <p>{{ task.source_path }}</p>
+  </div>
+  <span class="status-pill status-{{ task.status }}">{{ status_labels.get(task.status, task.status) }}</span>
+</div>
+
+<section class="metrics">
+  <div><span>处理范围</span><strong>{{ task.page_range_label }}</strong></div>
+  <div><span>可翻译段落</span><strong>{{ task.translatable_segments|length }}</strong></div>
+  <div><span>已准备内容</span><strong>{{ task.translated_count }}</strong></div>
+  <div><span>保留英文</span><strong>{{ task.source_fallback_segments|length }}</strong></div>
+  <div><span>文件大小</span><strong>{{ task.source_size_bytes|filesize }}</strong></div>
+</section>
+
+{% for warning in task.warnings %}
+  <div class="callout warning">{{ warning }}</div>
+{% endfor %}
+
+<section class="panel workflow-section" id="export" data-workflow-section>
+  <div class="section-title"><span class="step-number">1</span><div><h2>导出翻译包</h2><p>优先生成单个 XLSX；只有文件接近 10 MB 时才自动分包。</p></div></div>
+  <form action="{{ url_for('export_packages', task_id=task.task_id) }}" method="post" data-export-form>
+    <button class="button primary" type="submit">生成 / 重新生成并下载 XLSX</button>
+    <p class="form-status" data-export-status aria-live="polite"></p>
+  </form>
+</section>
+
+<section class="panel workflow-section" id="google" data-workflow-section>
+  <div class="section-title"><span class="step-number">2</span><div><h2>打开 Google Translate</h2><p>上传刚下载的 XLSX，选择英语翻译为简体中文，然后下载翻译件。</p></div></div>
+  <a class="button primary" href="https://translate.google.com/?sl=en&tl=zh-CN&op=docs" target="_blank" rel="noreferrer" data-google-translate>打开 Google Translate</a>
+</section>
+
+<section class="panel workflow-section" id="import" data-workflow-section>
+  <div class="section-title"><span class="step-number">3</span><div><h2>导入翻译件</h2><p>选择 Google 下载的 XLSX；导入、检查和缺失内容修复会在后台自动完成。</p></div></div>
+  <form action="{{ url_for('import_packages', task_id=task.task_id) }}" method="post" enctype="multipart/form-data" data-import-form>
+    <label class="file-picker"><input type="file" name="translations" accept=".xlsx" multiple required data-translation-files><span data-import-label>选择 Google 下载的 XLSX</span></label>
+    <p class="form-status" data-import-status aria-live="polite"></p>
+  </form>
+  {% if report.can_generate %}
+    <div class="callout success ready-state">
+      <strong>✓ 准备就绪</strong>
+      <span>{{ task.chinese_translation_count }} 段使用译文；{{ task.source_fallback_segments|length }} 段保留原英文。</span>
+    </div>
+    {% if task.source_fallback_segments %}
+      <details class="data-disclosure fallback-disclosure">
+        <summary>查看保留英文内容（{{ task.source_fallback_segments|length }} 段）</summary>
+        <div class="fallback-list">
+          {% for segment in task.source_fallback_segments %}
+            <article>
+              <header><code>{{ segment.segment_id }}</code><span>原第 {{ segment.page_number }} 页</span></header>
+              <p class="issue">{{ segment.fallback_reason }}</p>
+              <p class="source-text">{{ segment.source_text|truncate(240, true) }}</p>
+            </article>
+          {% endfor %}
+        </div>
+      </details>
+    {% endif %}
+  {% elif task.last_validation %}
+    <div class="callout error">翻译件无法安全对应当前任务，请重新选择正确的 XLSX。</div>
+  {% endif %}
+</section>
+
+<section class="panel workflow-section" id="generate" data-workflow-section>
+  <div class="section-title"><span class="step-number">4</span><div><h2>生成结果</h2><p>选择一种最终文件；两种方式都使用保持原页面结构的中文版。</p></div></div>
+  <form action="{{ url_for('generate', task_id=task.task_id) }}" method="post" class="job-form" data-job-form data-kind="generate">
+    {% set last_output_mode = (task.last_generation or {}).get('output_mode', 'layout') %}
+    <div class="output-mode-list" role="radiogroup" aria-label="PDF 输出方式">
+      <label class="output-mode">
+        <input type="radio" name="output_mode" value="layout"{% if last_output_mode != 'source_layout' %} checked{% endif %}>
+        <span><strong>原版面中文版（推荐）</strong><small>只生成保持图片、表格、装饰和页面尺寸的中文版。</small></span>
+      </label>
+      <label class="output-mode">
+        <input type="radio" name="output_mode" value="source_layout"{% if last_output_mode == 'source_layout' %} checked{% endif %}>
+        <span><strong>原文 + 原版面中文版</strong><small>原第 1 页 → 中文第 1 页 → 原第 2 页 → 中文第 2 页，依次交错。</small></span>
+      </label>
+    </div>
+    <label>原版面背景修补清晰度
+      <select name="layout_dpi">
+        <option value="170">快速预览 · 170 DPI</option>
+        <option value="200" selected>正式输出 · 200 DPI（推荐）</option>
+        <option value="240">精细输出 · 240 DPI（小字/复杂背景）</option>
+      </select>
+    </label>
+    <p class="form-hint">这里只影响英文擦除和背景修补，不影响 OCR 识别或中文矢量文字清晰度。生成时会自动使用当前机器的全部 {{ render_cores }} 个逻辑核心。</p>
+    {% if task.last_generation and task.last_generation.get('layout_requested') %}
+      <div class="callout info">
+        上次生成：
+        {% if task.last_generation.get('source_layout_requested') %}
+          原文 + 原版面中文版
+        {% else %}
+          原版面中文版
+        {% endif %}
+        · {{ task.last_generation.get('layout_dpi') }} DPI ·
+        {% if task.last_generation.get('source_layout_cache_hit') %}
+          已复用相同设置的完整结果
+        {% elif task.last_generation.get('layout_cache_hit') %}
+          已复用相同设置的缓存结果
+        {% else %}
+          使用 {{ task.last_generation.get('layout_render_workers', 1) }} 个核心完成
+        {% endif %}
+      </div>
+    {% endif %}
+    {% if not report.can_generate %}
+      <div class="callout warning">请先导入 Google 下载的翻译件。</div>
+    {% else %}
+      <div class="callout success">准备就绪，可以生成最终 PDF。</div>
+    {% endif %}
+    <button class="button primary" type="submit">生成最终 PDF</button>
+    <div class="job-progress" hidden>
+      <div class="progress-copy"><span data-job-message>准备中</span><span data-job-percent>0%</span></div>
+      <div class="progress-track"><span data-job-bar></span></div>
+      <p class="form-error" data-job-error></p>
+    </div>
+  </form>
+  {% if task.outputs %}
+    <div class="file-list outputs" data-output-files>
+      {% for kind, label in [
+        ('layout_pdf', '原版面中文版 PDF'),
+        ('source_layout_pdf', '原文 + 原版面中文版 PDF')
+      ] %}
+        {% if task.outputs.get(kind) %}
+          <a href="{{ url_for('download_output', task_id=task.task_id, kind=kind) }}"><span>{{ label }}</span><em>下载</em></a>
+        {% endif %}
+      {% endfor %}
+    </div>
+  {% endif %}
+</section>
+{% endblock %}
