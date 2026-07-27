@@ -141,6 +141,8 @@ if (importForm) {
 const analysisForm = document.querySelector("[data-analysis-form]");
 if (analysisForm) {
   const pdfPickerButton = analysisForm.querySelector("[data-select-pdf]");
+  const browserPdfInput = analysisForm.querySelector("[data-browser-pdf]");
+  const sourceLabel = analysisForm.querySelector("[data-source-label]");
   const pathInput = analysisForm.querySelector("[data-source-path]");
   const pathStatus = analysisForm.querySelector("[data-path-status]");
   const pageStart = analysisForm.querySelector("[data-page-start]");
@@ -157,6 +159,8 @@ if (analysisForm) {
   const retryVision = analysisForm.querySelector("[data-retry-vision]");
   let inspectionRequest = 0;
   let inspectionTimer = 0;
+  let localAccess = true;
+  let maxUploadMb = 1024;
 
   function syncOcrControls() {
     const textOnly = ocrMode.value === "off";
@@ -233,6 +237,56 @@ if (analysisForm) {
     inspectionTimer = window.setTimeout(inspectPdf, 450);
   }
 
+  async function detectAccessMode() {
+    try {
+      const response = await fetch("/api/access-mode", { cache: "no-store" });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "无法判断访问模式");
+      localAccess = Boolean(payload.local);
+      maxUploadMb = payload.max_upload_mb || maxUploadMb;
+    } catch (_reason) {
+      localAccess = ["localhost", "127.0.0.1", "::1"].includes(
+        window.location.hostname
+      );
+    }
+
+    pathInput.readOnly = !localAccess;
+    sourceLabel.textContent = localAccess
+      ? "本地 PDF 绝对路径"
+      : "已上传到服务器的 PDF";
+    pdfPickerButton.textContent = localAccess
+      ? "选择 PDF 文件"
+      : "选择并上传 PDF";
+    pathStatus.textContent = localAccess
+      ? "可以点击选择，也可以粘贴带单引号或双引号的路径。"
+      : `远程访问会通过局域网上传到服务器 Mac；较大的文件可能需要等待。当前上限 ${maxUploadMb} MB。`;
+  }
+
+  async function uploadRemotePdf(file) {
+    pdfPickerButton.disabled = true;
+    pathInput.value = "";
+    inspection.hidden = true;
+    pathStatus.textContent = `正在通过局域网上传 ${file.name}；请保持页面打开…`;
+    const data = new FormData();
+    data.set("pdf", file, file.name);
+    try {
+      const response = await fetch("/api/upload-pdf", {
+        method: "POST",
+        body: data,
+      });
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.error || "PDF 上传失败");
+      pathInput.value = payload.path;
+      pathStatus.textContent = `已上传 ${payload.filename}（${payload.size_label}），正在快速检查。`;
+      await inspectPdf();
+    } catch (reason) {
+      pathStatus.textContent = reason.message || String(reason);
+    } finally {
+      pdfPickerButton.disabled = false;
+      browserPdfInput.value = "";
+    }
+  }
+
   ocrMode.addEventListener("change", syncOcrControls);
   pathInput.addEventListener("input", schedulePdfInspection);
   pageStart.addEventListener("input", schedulePdfInspection);
@@ -247,9 +301,19 @@ if (analysisForm) {
     recovery.hidden = true;
     analysisForm.requestSubmit();
   });
+  browserPdfInput.addEventListener("change", () => {
+    const file = browserPdfInput.files?.[0];
+    if (file) uploadRemotePdf(file);
+  });
   syncOcrControls();
+  detectAccessMode();
 
   pdfPickerButton.addEventListener("click", async () => {
+    if (!localAccess) {
+      browserPdfInput.click();
+      return;
+    }
+
     pdfPickerButton.disabled = true;
     pathStatus.textContent = "正在打开 macOS 文件选择器…";
     try {

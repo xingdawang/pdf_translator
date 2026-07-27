@@ -219,7 +219,7 @@ def run(args: argparse.Namespace) -> int:
         command = [
             sys.executable,
             "-m",
-            "pdf_translator.flask_app",
+            "pdf_translator.hybrid_app",
             "--host",
             args.host,
             "--port",
