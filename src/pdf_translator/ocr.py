@@ -6,12 +6,19 @@ import re
 import shutil
 import statistics
 import subprocess
+import tempfile
+import threading
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .exceptions import PDFAnalysisError
+from .config import DEFAULT_DPI
 from .utils import normalize_whitespace
+
+
+_VISION_BUILD_LOCK = threading.Lock()
 
 
 @dataclass
@@ -58,7 +65,7 @@ class _OCRLine:
 class MacVisionOCR:
     """Optional local OCR powered by the macOS Vision framework."""
 
-    def __init__(self, cache_dir: Path, dpi: int = 180):
+    def __init__(self, cache_dir: Path, dpi: int = DEFAULT_DPI):
         self.cache_dir = cache_dir
         self.dpi = dpi
         self.source_path = (
@@ -81,10 +88,14 @@ class MacVisionOCR:
             )
         self._ensure_binary()
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        image_path: Path | None = None
-        try:
+        with tempfile.TemporaryDirectory(
+            prefix=f"ocr-page-{page_number:05d}-",
+            dir=self.cache_dir,
+        ) as temporary_dir:
             image_path, source_rect = self._source_image_or_render(
-                page, page_number
+                page,
+                page_number,
+                Path(temporary_dir),
             )
             completed = subprocess.run(
                 [str(self.binary_path), str(image_path), "en-US"],
@@ -107,14 +118,16 @@ class MacVisionOCR:
                 source_rect=source_rect,
             )
             return self._group_lines(lines, float(page.rect.width))
-        finally:
-            if image_path is not None:
-                image_path.unlink(missing_ok=True)
 
     def _source_image_or_render(
-        self, page: Any, page_number: int
+        self,
+        page: Any,
+        page_number: int,
+        work_dir: Path | None = None,
     ) -> tuple[Path, list[float]]:
         """Prefer the original full-page scan to avoid rasterizer-softened text."""
+        destination_dir = work_dir or self.cache_dir
+        destination_dir.mkdir(parents=True, exist_ok=True)
         try:
             images = page.get_images(full=True)
             if len(images) == 1:
@@ -145,7 +158,7 @@ class MacVisionOCR:
                     extension = str(extracted.get("ext", "png")).lower()
                     if extension not in {"png", "jpg", "jpeg", "tiff", "heic"}:
                         extension = "png"
-                    image_path = self.cache_dir / (
+                    image_path = destination_dir / (
                         f"ocr_page_{page_number:05d}.{extension}"
                     )
                     image_path.write_bytes(extracted["image"])
@@ -158,7 +171,7 @@ class MacVisionOCR:
         except Exception:
             pass
 
-        image_path = self.cache_dir / f"ocr_page_{page_number:05d}.png"
+        image_path = destination_dir / f"ocr_page_{page_number:05d}.png"
         pixmap = page.get_pixmap(dpi=self.dpi, alpha=False)
         pixmap.save(str(image_path))
         return image_path, [
@@ -175,27 +188,48 @@ class MacVisionOCR:
         ):
             return
         self.cache_dir.mkdir(parents=True, exist_ok=True)
-        self.module_cache.mkdir(parents=True, exist_ok=True)
-        temporary = self.binary_path.with_suffix(".tmp")
-        completed = subprocess.run(
-            [
-                "swiftc",
-                "-module-cache-path",
-                str(self.module_cache),
-                str(self.source_path),
-                "-o",
-                str(temporary),
-            ],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=180,
-        )
-        if completed.returncode != 0:
-            detail = completed.stderr.strip() or "未知错误"
-            raise PDFAnalysisError(f"无法编译 macOS Vision OCR 辅助程序：{detail}")
-        temporary.chmod(0o755)
-        temporary.replace(self.binary_path)
+        lock_path = self.cache_dir / ".vision-ocr-build.lock"
+        with _VISION_BUILD_LOCK, lock_path.open("a+b") as lock_stream:
+            try:
+                import fcntl
+
+                fcntl.flock(lock_stream.fileno(), fcntl.LOCK_EX)
+            except ImportError:
+                pass
+            if (
+                self.binary_path.is_file()
+                and self.binary_path.stat().st_mtime
+                >= self.source_path.stat().st_mtime
+            ):
+                return
+            self.module_cache.mkdir(parents=True, exist_ok=True)
+            temporary = self.binary_path.with_name(
+                f".{self.binary_path.name}-{uuid.uuid4().hex}.tmp"
+            )
+            try:
+                completed = subprocess.run(
+                    [
+                        "swiftc",
+                        "-module-cache-path",
+                        str(self.module_cache),
+                        str(self.source_path),
+                        "-o",
+                        str(temporary),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
+                )
+                if completed.returncode != 0:
+                    detail = completed.stderr.strip() or "未知错误"
+                    raise PDFAnalysisError(
+                        f"无法编译 macOS Vision OCR 辅助程序：{detail}"
+                    )
+                temporary.chmod(0o755)
+                temporary.replace(self.binary_path)
+            finally:
+                temporary.unlink(missing_ok=True)
 
     @staticmethod
     def _lines_from_payload(

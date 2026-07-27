@@ -233,7 +233,11 @@ class XLSXExporter:
         metadata.sheet_state = "hidden"
         metadata_rows = [
             ("format", "local-pdf-translator-xlsx"),
-            ("format_version", "1"),
+            ("format_version", "2"),
+            (
+                "document_ir_version",
+                task.document_ir.version if task.document_ir else 0,
+            ),
             ("task_id", task.task_id),
             ("package_id", package_id),
             ("package_index", package_index),
@@ -294,6 +298,8 @@ class XLSXImporter:
                 if key_index is None:
                     continue
                 key = self._normalize_row_key(row[key_index])
+                if key is None:
+                    continue
                 if key in translations:
                     duplicates.append(key)
                     continue
@@ -476,6 +482,16 @@ class XLSXImporter:
         text = str(value).strip()
         if text.isdigit():
             return text.zfill(8)
+        paragraph_match = re.fullmatch(
+            r"P(\d{1,8})-S(\d{1,10})",
+            text,
+            re.IGNORECASE,
+        )
+        if paragraph_match:
+            return (
+                f"P{int(paragraph_match.group(1)):04d}-"
+                f"S{int(paragraph_match.group(2)):06d}"
+            )
         match = re.fullmatch(r"R?(\d{1,8})", text, re.IGNORECASE)
         return match.group(1).zfill(8) if match else None
 

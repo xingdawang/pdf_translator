@@ -4,13 +4,14 @@ import hashlib
 import json
 import shutil
 import uuid
+from functools import wraps
 from pathlib import Path
 from typing import Callable
 
 from pypdf import PdfReader, PdfWriter
 from pypdf.errors import PyPdfError
 
-from .config import AppConfig
+from .config import AppConfig, DEFAULT_DPI
 from .exceptions import PDFAnalysisError, ValidationBlockedError
 from .models import (
     TaskSettings,
@@ -34,6 +35,17 @@ from .xlsx_io import ImportResult, XLSXExporter, XLSXImporter
 
 
 ProgressCallback = Callable[[int, int], None]
+
+
+def _task_locked(method):
+    """Serialize mutations for one task across web and CLI entry points."""
+
+    @wraps(method)
+    def wrapped(self, task_id: str, *args, **kwargs):
+        with self.repository.task_guard(task_id):
+            return method(self, task_id, *args, **kwargs)
+
+    return wrapped
 
 
 class TranslationWorkflow:
@@ -87,48 +99,56 @@ class TranslationWorkflow:
             shutil.copy2(source, destination)
             actual_source = destination
 
-        file_hash = sha256_file(actual_source)
-        selected_settings = settings or TaskSettings()
-        parser = PDFParser(
-            self.config.minimum_text_characters_per_page,
-            ocr_cache_dir=self.config.data_dir / "cache" / "vision-ocr",
-        )
-        parsed = parser.parse(
-            actual_source,
-            task_id=task_id,
-            settings=selected_settings,
-            progress=progress,
-        )
-        warnings = list(parsed.warnings)
-        text_ratio = parsed.text_page_count / max(parsed.page_count, 1)
-        if text_ratio < self.config.minimum_text_page_ratio:
-            warnings.append(
-                f"只有 {text_ratio:.0%} 的页面包含足够文本。该文件可能以图片或扫描页为主。"
+        try:
+            source_stat = actual_source.stat()
+            file_hash = sha256_file(actual_source)
+            selected_settings = settings or TaskSettings()
+            parser = PDFParser(
+                self.config.minimum_text_characters_per_page,
+                ocr_cache_dir=self.config.data_dir / "cache" / "vision-ocr",
             )
+            parsed = parser.parse(
+                actual_source,
+                task_id=task_id,
+                settings=selected_settings,
+                progress=progress,
+            )
+            warnings = list(parsed.warnings)
+            text_ratio = parsed.text_page_count / max(parsed.page_count, 1)
+            if text_ratio < self.config.minimum_text_page_ratio:
+                warnings.append(
+                    f"只有 {text_ratio:.0%} 的页面包含足够文本。该文件可能以图片或扫描页为主。"
+                )
 
-        now = utc_now()
-        task = TranslationTask(
-            task_id=task_id,
-            source_path=str(actual_source),
-            source_filename=source.name,
-            source_file_hash=file_hash,
-            source_size_bytes=actual_source.stat().st_size,
-            created_at=now,
-            updated_at=now,
-            status="analyzed",
-            page_count=parsed.page_count,
-            text_page_count=parsed.text_page_count,
-            scanned_page_count=parsed.scanned_page_count,
-            image_count=parsed.image_count,
-            parser_version=parser.parser_version,
-            settings=selected_settings,
-            segments=parsed.segments,
-            warnings=warnings,
-            source_page_count=parsed.source_page_count,
-        )
-        self.repository.save(task)
-        return task
+            now = utc_now()
+            task = TranslationTask(
+                task_id=task_id,
+                source_path=str(actual_source),
+                source_filename=source.name,
+                source_file_hash=file_hash,
+                source_size_bytes=source_stat.st_size,
+                created_at=now,
+                updated_at=now,
+                status="analyzed",
+                page_count=parsed.page_count,
+                text_page_count=parsed.text_page_count,
+                scanned_page_count=parsed.scanned_page_count,
+                image_count=parsed.image_count,
+                parser_version=parser.parser_version,
+                settings=selected_settings,
+                segments=parsed.segments,
+                warnings=warnings,
+                source_page_count=parsed.source_page_count,
+                source_mtime_ns=source_stat.st_mtime_ns,
+                document_ir=parsed.document_ir,
+            )
+            self.repository.save(task)
+            return task
+        except Exception:
+            shutil.rmtree(task_dir, ignore_errors=True)
+            raise
 
+    @_task_locked
     def export_packages(
         self,
         task_id: str,
@@ -152,6 +172,7 @@ class TranslationWorkflow:
         self.repository.save(task)
         return task, [destination / package.filename for package in packages]
 
+    @_task_locked
     def import_packages(
         self,
         task_id: str,
@@ -188,6 +209,7 @@ class TranslationWorkflow:
         self.repository.save(task)
         return task, results, report
 
+    @_task_locked
     def validate(self, task_id: str) -> tuple[TranslationTask, ValidationReport]:
         task = self.repository.load(task_id)
         persisted_technical_issues = [
@@ -207,6 +229,7 @@ class TranslationWorkflow:
         self.repository.save(task)
         return task, report
 
+    @_task_locked
     def update_translations(
         self, task_id: str, updates: dict[str, str]
     ) -> tuple[TranslationTask, ValidationReport]:
@@ -288,6 +311,7 @@ class TranslationWorkflow:
 
         return retained_issues + fallback_issues
 
+    @_task_locked
     def confirm_review(
         self, task_id: str
     ) -> tuple[TranslationTask, ValidationReport]:
@@ -338,7 +362,7 @@ class TranslationWorkflow:
             ) from exc
 
         fingerprint_payload = {
-            "version": "source-layout-interleave-v1",
+            "version": "source-layout-interleave-v2-deduplicated",
             "source_file_hash": task.source_file_hash,
             "source_page_numbers": task.selected_page_numbers,
             "layout_fingerprint": layout_fingerprint,
@@ -397,6 +421,7 @@ class TranslationWorkflow:
                 ),
             }
         )
+        writer.compress_identical_objects()
         temporary_output = output_path.with_suffix(".pdf.tmp")
         with temporary_output.open("wb") as stream:
             writer.write(stream)
@@ -458,6 +483,7 @@ class TranslationWorkflow:
         except (OSError, IndexError, TypeError, ValueError, PyPdfError):
             return False
 
+    @_task_locked
     def generate(
         self,
         task_id: str,
@@ -467,9 +493,11 @@ class TranslationWorkflow:
         source_layout: bool = False,
         show_segment_ids: bool = False,
         font_path: str | Path | None = None,
-        layout_dpi: int = 170,
+        layout_dpi: int = DEFAULT_DPI,
         progress: ProgressCallback | None = None,
     ) -> tuple[TranslationTask, RenderOutputs]:
+        source_task = self.repository.load(task_id)
+        self._assert_source_unchanged(source_task)
         task, report = self.validate(task_id)
         if not any((chinese, bilingual, layout, source_layout)):
             raise ValueError("至少选择一种 PDF 输出。")
@@ -558,3 +586,36 @@ class TranslationWorkflow:
         task.updated_at = utc_now()
         self.repository.save(task)
         return task, outputs
+
+    @_task_locked
+    def cleanup_task(self, task_id: str) -> int:
+        return self.repository.cleanup_task_files(task_id)
+
+    @_task_locked
+    def delete_task(self, task_id: str) -> Path:
+        return self.repository.delete_task(task_id)
+
+    def _assert_source_unchanged(self, task: TranslationTask) -> None:
+        source = Path(task.source_path)
+        if not source.is_file():
+            raise ValidationBlockedError(
+                f"原始 PDF 已移动或删除，请重新创建任务：{source}"
+            )
+        stat = source.stat()
+        if (
+            task.source_mtime_ns is not None
+            and stat.st_size == task.source_size_bytes
+            and stat.st_mtime_ns == task.source_mtime_ns
+        ):
+            return
+
+        current_hash = sha256_file(source)
+        if current_hash != task.source_file_hash:
+            raise ValidationBlockedError(
+                "原始 PDF 自任务创建后已经发生变化。为避免把旧译文放到错误位置，"
+                "请重新分析该 PDF。"
+            )
+        task.source_size_bytes = stat.st_size
+        task.source_mtime_ns = stat.st_mtime_ns
+        task.updated_at = utc_now()
+        self.repository.save(task)

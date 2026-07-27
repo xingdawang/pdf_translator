@@ -15,7 +15,16 @@
     <h1>{{ task.source_filename }}</h1>
     <p>{{ task.source_path }}</p>
   </div>
-  <span class="status-pill status-{{ task.status }}">{{ status_labels.get(task.status, task.status) }}</span>
+  <div class="task-heading-actions">
+    <span class="status-pill status-{{ task.status }}">{{ status_labels.get(task.status, task.status) }}</span>
+    <a class="button secondary compact" href="{{ url_for('task_structure', task_id=task.task_id) }}">检查段落结构</a>
+    <form action="{{ url_for('cleanup_task', task_id=task.task_id) }}" method="post">
+      <button class="button secondary compact" type="submit">清理缓存与旧文件</button>
+    </form>
+    <form action="{{ url_for('delete_task', task_id=task.task_id) }}" method="post" onsubmit="return window.confirm('确认删除这个任务？任务文件会移入 data/trash，可手动恢复。');">
+      <button class="button danger compact" type="submit">删除任务</button>
+    </form>
+  </div>
 </div>
 
 <section class="metrics">
@@ -24,6 +33,7 @@
   <div><span>已准备内容</span><strong>{{ task.translated_count }}</strong></div>
   <div><span>保留英文</span><strong>{{ task.source_fallback_segments|length }}</strong></div>
   <div><span>文件大小</span><strong>{{ task.source_size_bytes|filesize }}</strong></div>
+  <div><span>任务占用</span><strong>{{ task.storage_size_bytes|filesize }}</strong></div>
 </section>
 
 {% for warning in task.warnings %}
@@ -87,11 +97,13 @@
         <span><strong>原文 + 原版面中文版</strong><small>原第 1 页 → 中文第 1 页 → 原第 2 页 → 中文第 2 页，依次交错。</small></span>
       </label>
     </div>
+    {% set recorded_layout_dpi = (task.last_generation or {}).get('layout_dpi', default_dpi) %}
+    {% set selected_layout_dpi = recorded_layout_dpi if recorded_layout_dpi in dpi_choices else default_dpi %}
     <label>原版面背景修补清晰度
       <select name="layout_dpi">
-        <option value="170" selected>正式输出 · 170 DPI（推荐）</option>
-        <option value="200">高清输出 · 200 DPI</option>
-        <option value="240">精细输出 · 240 DPI（小字/复杂背景）</option>
+        {% for dpi in dpi_choices %}
+          <option value="{{ dpi }}"{% if dpi == selected_layout_dpi %} selected{% endif %}>{{ dpi_profiles[dpi].layout_label }} · {{ dpi }} DPI{% if dpi_profiles[dpi].layout_note %}（{{ dpi_profiles[dpi].layout_note }}）{% endif %}</option>
+        {% endfor %}
       </select>
     </label>
     <p class="form-hint">这里只影响英文擦除和背景修补，不影响 OCR 识别或中文矢量文字清晰度。生成时会自动使用当前机器的全部 {{ render_cores }} 个逻辑核心。</p>

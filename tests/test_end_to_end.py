@@ -7,6 +7,7 @@ from openpyxl import load_workbook
 from pypdf import PdfReader
 
 from pdf_translator.config import AppConfig
+from pdf_translator.exceptions import ValidationBlockedError
 from pdf_translator.models import TaskSettings
 from pdf_translator.workflow import TranslationWorkflow
 from scripts.sample_assets import create_sample_pdf, mock_translate_xlsx
@@ -106,6 +107,21 @@ def test_quoted_path_and_page_range_generate_only_selected_pages(tmp_path):
     )
 
     assert len(PdfReader(str(outputs.layout_pdf)).pages) == 1
+
+
+def test_generation_stops_if_source_pdf_changed_after_analysis(tmp_path):
+    source = create_sample_pdf(tmp_path / "sample.pdf")
+    workflow = TranslationWorkflow(AppConfig.from_env(tmp_path / "data"))
+    task = workflow.create_task(source)
+    source.write_bytes(source.read_bytes() + b"\n% changed after analysis\n")
+
+    with pytest.raises(ValidationBlockedError, match="发生变化"):
+        workflow.generate(
+            task.task_id,
+            chinese=False,
+            bilingual=False,
+            layout=True,
+        )
 
 
 def test_source_and_layout_output_interleaves_matching_pages_and_reuses_cache(

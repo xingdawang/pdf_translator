@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import logging
 import math
 import os
 import subprocess
@@ -12,6 +13,7 @@ import webbrowser
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
+from io import BytesIO
 from pathlib import Path
 from typing import Any, Callable
 
@@ -28,7 +30,13 @@ from flask import (
 )
 from werkzeug.utils import secure_filename
 
-from .config import AppConfig
+from .config import (
+    AppConfig,
+    DEFAULT_DPI,
+    DPI_CHOICES,
+    DPI_PROFILES,
+    parse_dpi,
+)
 from .exceptions import NoTextLayerError
 from .models import TaskSettings
 from .utils import file_size_label, normalize_local_path, safe_stem, utc_now
@@ -43,6 +51,8 @@ STATUS_LABELS = {
     "generated": "生成完成",
 }
 ETA_QUANTUM_SECONDS = 10
+JOB_RETENTION_SECONDS = 24 * 60 * 60
+logger = logging.getLogger(__name__)
 
 
 def _rounded_eta_seconds(seconds: float) -> int:
@@ -79,10 +89,14 @@ class BackgroundJob:
     error_code: str | None = None
     created_at: str = field(default_factory=utc_now)
     _eta_deadline: float | None = field(default=None, repr=False)
+    _finished_monotonic: float | None = field(default=None, repr=False)
+    _dedupe_key: str | None = field(default=None, repr=False)
 
     def payload(self) -> dict[str, Any]:
         data = asdict(self)
         eta_deadline = data.pop("_eta_deadline", None)
+        data.pop("_finished_monotonic", None)
+        data.pop("_dedupe_key", None)
         data["progress"] = (
             round(self.current / self.total * 100, 1) if self.total else 0
         )
@@ -113,7 +127,9 @@ class BackgroundJob:
 class JobManager:
     def __init__(self, workers: int = 2):
         self._jobs: dict[str, BackgroundJob] = {}
+        self._active_keys: dict[str, str] = {}
         self._lock = threading.Lock()
+        self._heavy_job_slot = threading.Semaphore(1)
         self._pool = ThreadPoolExecutor(
             max_workers=workers, thread_name_prefix="pdf-translator"
         )
@@ -122,19 +138,28 @@ class JobManager:
         self,
         kind: str,
         worker: Callable[[Callable[[int, int], None]], str],
+        dedupe_key: str | None = None,
     ) -> BackgroundJob:
-        job = BackgroundJob(job_id=uuid.uuid4().hex, kind=kind)
+        active_key = f"{kind}:{dedupe_key}" if dedupe_key else None
         with self._lock:
+            self._prune_locked()
+            if active_key and active_key in self._active_keys:
+                existing = self._jobs.get(self._active_keys[active_key])
+                if existing and existing.state in {"queued", "running"}:
+                    return existing
+                self._active_keys.pop(active_key, None)
+            job = BackgroundJob(
+                job_id=uuid.uuid4().hex,
+                kind=kind,
+                _dedupe_key=active_key,
+            )
             self._jobs[job.job_id] = job
+            if active_key:
+                self._active_keys[active_key] = job.job_id
 
         def run() -> None:
             opening_message = (
                 "正在打开并检查 PDF" if kind == "analyze" else "正在准备生成"
-            )
-            self._update(
-                job.job_id,
-                state="running",
-                message=opening_message,
             )
 
             eta_phase_started = time.monotonic()
@@ -193,7 +218,14 @@ class JobManager:
                 )
 
             try:
-                task_id = worker(progress)
+                with self._heavy_job_slot:
+                    eta_phase_started = time.monotonic()
+                    self._update(
+                        job.job_id,
+                        state="running",
+                        message=opening_message,
+                    )
+                    task_id = worker(progress)
                 self._update(
                     job.job_id,
                     state="completed",
@@ -201,6 +233,7 @@ class JobManager:
                     message="处理完成",
                 )
             except Exception as exc:
+                logger.exception("后台 %s 任务失败", kind)
                 self._update(
                     job.job_id,
                     state="failed",
@@ -212,12 +245,23 @@ class JobManager:
                     ),
                     message="处理失败",
                 )
+            finally:
+                with self._lock:
+                    completed_job = self._jobs.get(job.job_id)
+                    if completed_job is not None:
+                        completed_job._finished_monotonic = time.monotonic()
+                    if (
+                        active_key
+                        and self._active_keys.get(active_key) == job.job_id
+                    ):
+                        self._active_keys.pop(active_key, None)
 
         self._pool.submit(run)
         return job
 
     def get(self, job_id: str) -> BackgroundJob | None:
         with self._lock:
+            self._prune_locked()
             return self._jobs.get(job_id)
 
     def _update(self, job_id: str, **values: Any) -> None:
@@ -225,6 +269,17 @@ class JobManager:
             job = self._jobs[job_id]
             for key, value in values.items():
                 setattr(job, key, value)
+
+    def _prune_locked(self) -> None:
+        cutoff = time.monotonic() - JOB_RETENTION_SECONDS
+        expired = [
+            job_id
+            for job_id, job in self._jobs.items()
+            if job._finished_monotonic is not None
+            and job._finished_monotonic < cutoff
+        ]
+        for job_id in expired:
+            self._jobs.pop(job_id, None)
 
 
 def create_app(config: AppConfig | None = None) -> Flask:
@@ -248,7 +303,12 @@ def create_app(config: AppConfig | None = None) -> Flask:
 
     @app.context_processor
     def common_values() -> dict[str, Any]:
-        return {"status_labels": STATUS_LABELS}
+        return {
+            "status_labels": STATUS_LABELS,
+            "default_dpi": DEFAULT_DPI,
+            "dpi_choices": DPI_CHOICES,
+            "dpi_profiles": DPI_PROFILES,
+        }
 
     @app.get("/")
     def index():
@@ -289,9 +349,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
                 if line.strip()
             ],
             ocr_mode=request.form.get("ocr_mode", "vision"),
-            ocr_dpi=_bounded_int(
-                request.form.get("ocr_dpi"), default=170, minimum=120, maximum=300
-            ),
+            ocr_dpi=parse_dpi(request.form.get("ocr_dpi")),
         )
 
         def worker(progress):
@@ -303,7 +361,18 @@ def create_app(config: AppConfig | None = None) -> Flask:
             )
             return task.task_id
 
-        return jsonify(jobs.submit("analyze", worker).payload()), 202
+        analyze_key = "|".join(
+            (
+                source_path,
+                str(page_start),
+                str(page_end or ""),
+                settings.ocr_mode,
+                str(settings.ocr_dpi),
+            )
+        )
+        return jsonify(
+            jobs.submit("analyze", worker, dedupe_key=analyze_key).payload()
+        ), 202
 
     @app.post("/api/inspect-pdf")
     def inspect_pdf():
@@ -383,6 +452,130 @@ def create_app(config: AppConfig | None = None) -> Flask:
             task_dir=workflow.repository.task_dir(task_id),
             render_cores=os.cpu_count() or 1,
         )
+
+    @app.get("/tasks/<task_id>/structure")
+    def task_structure(task_id: str):
+        task = workflow.repository.load(task_id)
+        available_pages = task.selected_page_numbers
+        if not available_pages:
+            abort(404)
+        page_number = _bounded_int(
+            request.args.get("page"),
+            default=available_pages[0],
+            minimum=available_pages[0],
+            maximum=available_pages[-1],
+        )
+        if page_number not in available_pages:
+            abort(404)
+
+        page_ir = next(
+            (
+                page
+                for page in (task.document_ir.pages if task.document_ir else [])
+                if page.page_number == page_number
+            ),
+            None,
+        )
+        if page_ir is None:
+            try:
+                import fitz
+
+                with fitz.open(task.source_path) as document:
+                    page = document.load_page(page_number - 1)
+                    page_width = float(page.rect.width)
+                    page_height = float(page.rect.height)
+            except Exception:
+                abort(404)
+        else:
+            page_width = page_ir.width
+            page_height = page_ir.height
+
+        anchors: list[dict[str, Any]] = []
+        for segment in task.segments:
+            for anchor in segment.visual_anchors:
+                if anchor.page_number != page_number:
+                    continue
+                x0, y0, x1, y1 = anchor.bbox
+                anchors.append(
+                    {
+                        "anchor_id": anchor.anchor_id,
+                        "paragraph_id": segment.paragraph_id
+                        or segment.segment_id,
+                        "reading_order": anchor.reading_order,
+                        "layout_label": anchor.layout_label,
+                        "column_id": anchor.column_id,
+                        "continuation": segment.continuation,
+                        "source_text": anchor.source_text,
+                        "x": x0,
+                        "y": y0,
+                        "width": max(0.5, x1 - x0),
+                        "height": max(0.5, y1 - y0),
+                    }
+                )
+        anchors.sort(key=lambda item: (item["reading_order"], item["y"], item["x"]))
+        page_index = available_pages.index(page_number)
+        return render_template(
+            "structure.html",
+            task=task,
+            page_number=page_number,
+            page_width=page_width,
+            page_height=page_height,
+            anchors=anchors,
+            previous_page=(
+                available_pages[page_index - 1] if page_index > 0 else None
+            ),
+            next_page=(
+                available_pages[page_index + 1]
+                if page_index + 1 < len(available_pages)
+                else None
+            ),
+        )
+
+    @app.get("/tasks/<task_id>/structure/pages/<int:page_number>.png")
+    def task_structure_page(task_id: str, page_number: int):
+        task = workflow.repository.load(task_id)
+        if page_number not in task.selected_page_numbers:
+            abort(404)
+        try:
+            import fitz
+
+            with fitz.open(task.source_path) as document:
+                page = document.load_page(page_number - 1)
+                pixmap = page.get_pixmap(
+                    matrix=fitz.Matrix(1.5, 1.5),
+                    alpha=False,
+                )
+                image = BytesIO(pixmap.tobytes("png"))
+        except Exception:
+            abort(404)
+        return send_file(
+            image,
+            mimetype="image/png",
+            download_name=f"page-{page_number}.png",
+            max_age=300,
+        )
+
+    @app.post("/tasks/<task_id>/cleanup")
+    def cleanup_task(task_id: str):
+        try:
+            released = workflow.cleanup_task(task_id)
+            flash(
+                f"已清理临时文件、缓存和旧输出，释放 {file_size_label(released)}。",
+                "success",
+            )
+        except Exception as exc:
+            flash(f"清理失败：{exc}", "error")
+        return redirect(url_for("task_detail", task_id=task_id))
+
+    @app.post("/tasks/<task_id>/delete")
+    def delete_task(task_id: str):
+        try:
+            destination = workflow.delete_task(task_id)
+            flash(f"任务已移入本地回收目录：{destination}", "success")
+        except Exception as exc:
+            flash(f"删除任务失败：{exc}", "error")
+            return redirect(url_for("task_detail", task_id=task_id))
+        return redirect(url_for("index"))
 
     @app.post("/tasks/<task_id>/export")
     def export_packages(task_id: str):
@@ -502,12 +695,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
     @app.post("/api/tasks/<task_id>/generate")
     def generate(task_id: str):
         output_mode = request.form.get("output_mode", "layout")
-        layout_dpi = _bounded_int(
-            request.form.get("layout_dpi"),
-            default=170,
-            minimum=170,
-            maximum=260,
-        )
+        layout_dpi = parse_dpi(request.form.get("layout_dpi"))
         if output_mode not in {"layout", "source_layout"}:
             return jsonify({"error": "请选择有效的 PDF 输出方式。"}), 400
 
@@ -525,7 +713,9 @@ def create_app(config: AppConfig | None = None) -> Flask:
             )
             return task_id
 
-        return jsonify(jobs.submit("generate", worker).payload()), 202
+        return jsonify(
+            jobs.submit("generate", worker, dedupe_key=task_id).payload()
+        ), 202
 
     @app.get("/tasks/<task_id>/outputs/<kind>")
     def download_output(task_id: str, kind: str):

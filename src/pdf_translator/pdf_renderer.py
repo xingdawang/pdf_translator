@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -32,6 +34,7 @@ from .utils import atomic_write_json, safe_stem, utc_now
 
 
 ProgressCallback = Callable[[int, int], None]
+_FONT_REGISTRATION_LOCK = threading.Lock()
 
 
 @dataclass
@@ -49,22 +52,12 @@ class RenderOutputs:
 
 
 class ChineseFontResolver:
-    font_name = "PDFTranslatorChinese"
+    font_name_prefix = "PDFTranslatorChinese"
 
     def __init__(self, explicit_path: str | Path | None = None):
         self.explicit_path = Path(explicit_path).expanduser() if explicit_path else None
 
     def register(self) -> tuple[str, Path]:
-        existing = pdfmetrics.getRegisteredFontNames()
-        if self.font_name in existing:
-            registered = pdfmetrics.getFont(self.font_name)
-            filename = getattr(getattr(registered, "face", None), "filename", None)
-            return self.font_name, (
-                Path(filename)
-                if filename
-                else Path("<already-registered>")
-            )
-
         candidates = [
             self.explicit_path,
             Path(os.getenv("PDF_TRANSLATOR_FONT", "")).expanduser()
@@ -81,11 +74,26 @@ class ChineseFontResolver:
         ]
         for candidate in candidates:
             if candidate and candidate.is_file():
+                resolved = candidate.resolve()
+                font_stat = resolved.stat()
+                font_digest = hashlib.sha256(
+                    (
+                        f"{resolved}\0{font_stat.st_size}\0"
+                        f"{font_stat.st_mtime_ns}"
+                    ).encode("utf-8")
+                ).hexdigest()[:12]
+                font_name = f"{self.font_name_prefix}_{font_digest}"
                 try:
-                    pdfmetrics.registerFont(
-                        TTFont(self.font_name, str(candidate), subfontIndex=0)
-                    )
-                    return self.font_name, candidate
+                    with _FONT_REGISTRATION_LOCK:
+                        if font_name not in pdfmetrics.getRegisteredFontNames():
+                            pdfmetrics.registerFont(
+                                TTFont(
+                                    font_name,
+                                    str(resolved),
+                                    subfontIndex=0,
+                                )
+                            )
+                    return font_name, resolved
                 except Exception:
                     continue
         raise FontNotFoundError(
