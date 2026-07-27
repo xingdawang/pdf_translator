@@ -159,7 +159,9 @@ if (analysisForm) {
   const retryVision = analysisForm.querySelector("[data-retry-vision]");
   let inspectionRequest = 0;
   let inspectionTimer = 0;
-  let localAccess = true;
+  let localAccess = ["localhost", "127.0.0.1", "::1"].includes(
+    window.location.hostname
+  );
   let maxUploadMb = 1024;
 
   function syncOcrControls() {
