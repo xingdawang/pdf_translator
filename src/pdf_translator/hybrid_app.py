@@ -124,7 +124,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="本地 PDF 英译中 Flask 界面")
-    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", default=5050, type=int)
     parser.add_argument("--no-browser", action="store_true")
     parser.add_argument("--data-dir")
