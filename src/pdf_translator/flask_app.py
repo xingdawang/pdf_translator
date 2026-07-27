@@ -312,9 +312,30 @@ def create_app(config: AppConfig | None = None) -> Flask:
 
     @app.get("/")
     def index():
+        all_tasks = workflow.repository.list_tasks()
+        history_page_size = 5
+        history_page_count = max(
+            1,
+            (len(all_tasks) + history_page_size - 1) // history_page_size,
+        )
+        requested_history_page = request.args.get(
+            "history_page",
+            default=1,
+            type=int,
+        )
+        history_page = min(
+            max(requested_history_page or 1, 1),
+            history_page_count,
+        )
+        history_start = (history_page - 1) * history_page_size
         return render_template(
             "index.html",
-            tasks=workflow.repository.list_tasks(),
+            tasks=all_tasks[
+                history_start : history_start + history_page_size
+            ],
+            task_count=len(all_tasks),
+            history_page=history_page,
+            history_page_count=history_page_count,
             data_dir=workflow.config.data_dir,
         )
 

@@ -66,10 +66,13 @@
     </form>
   </section>
 
-  <section class="panel">
-    <div class="section-title">
+  <section class="panel history-panel">
+    <div class="section-title history-section-title">
       <span class="step-number muted">↺</span>
-      <div><h2>历史任务</h2><p>{{ tasks|length }} 个任务保存在本机。</p></div>
+      <div class="history-title-row">
+        <h2>任务历史</h2>
+        <p>{{ task_count }} 个任务保存在本机。</p>
+      </div>
     </div>
     <div class="task-list">
       {% for task in tasks %}
@@ -84,6 +87,19 @@
         <div class="empty-state">还没有任务。填入左侧路径即可开始。</div>
       {% endfor %}
     </div>
+    <nav class="history-pagination" aria-label="任务历史翻页">
+      {% if history_page > 1 %}
+        <a class="button secondary compact" href="{{ url_for('index', history_page=history_page - 1) }}">上一页</a>
+      {% else %}
+        <button class="button secondary compact" type="button" disabled>上一页</button>
+      {% endif %}
+      <span>第 {{ history_page }} / {{ history_page_count }} 页</span>
+      {% if history_page < history_page_count %}
+        <a class="button secondary compact" href="{{ url_for('index', history_page=history_page + 1) }}">下一页</a>
+      {% else %}
+        <button class="button secondary compact" type="button" disabled>下一页</button>
+      {% endif %}
+    </nav>
     <p class="data-path">数据目录<br><code>{{ data_dir }}</code></p>
   </section>
 </div>

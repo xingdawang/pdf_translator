@@ -1,6 +1,7 @@
 import io
 import time
 import zipfile
+from types import SimpleNamespace
 
 from openpyxl import load_workbook
 from reportlab.pdfgen import canvas
@@ -70,6 +71,39 @@ def test_index_renders_lightweight_local_ui(tmp_path):
     assert "150 DPI" not in response.get_data(as_text=True)
     assert "翻译范围与术语" not in response.get_data(as_text=True)
     assert 'name="protected_terms"' not in response.get_data(as_text=True)
+
+
+def test_index_paginates_five_history_tasks(tmp_path):
+    app = create_app(AppConfig.from_env(tmp_path / "data"))
+    app.config.update(TESTING=True)
+    workflow = app.extensions["translation_workflow"]
+    tasks = [
+        SimpleNamespace(
+            task_id=f"task-{index}",
+            source_filename=f"book-{index}.pdf",
+            page_range_label="第 1–1 页，共 1 页",
+            source_size_bytes=1024,
+            status="analyzed",
+        )
+        for index in range(7)
+    ]
+    workflow.repository.list_tasks = lambda: tasks
+
+    with app.test_client() as client:
+        first_page = client.get("/").get_data(as_text=True)
+        second_page = client.get("/?history_page=2").get_data(as_text=True)
+
+    assert "7 个任务保存在本机。" in first_page
+    assert first_page.count('class="task-card"') == 5
+    assert "book-0.pdf" in first_page
+    assert "book-5.pdf" not in first_page
+    assert "第 1 / 2 页" in first_page
+    assert 'href="/?history_page=2">下一页</a>' in first_page
+    assert second_page.count('class="task-card"') == 2
+    assert "book-0.pdf" not in second_page
+    assert "book-5.pdf" in second_page
+    assert "第 2 / 2 页" in second_page
+    assert 'href="/?history_page=1">上一页</a>' in second_page
 
 
 def test_native_pdf_picker_returns_selected_path(tmp_path, monkeypatch):
