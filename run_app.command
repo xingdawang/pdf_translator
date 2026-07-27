@@ -9,4 +9,4 @@ if [[ ! -x ".venv/bin/python" ]]; then
   exit 1
 fi
 
-exec ".venv/bin/python" -m pdf_translator.flask_app
+exec ".venv/bin/python" -m pdf_translator.hybrid_app
