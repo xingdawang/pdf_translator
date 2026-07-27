@@ -523,11 +523,17 @@ class PDFParser:
             if not supplied_bbox:
                 continue
             bbox = [round(float(value), 2) for value in supplied_bbox]
+            sizes = [
+                float(span.get("size", 0.0))
+                for span in spans
+                if float(span.get("size", 0.0)) > 0
+            ]
             visual_lines.append(
                 {
                     "text": text,
                     "spans": spans,
                     "bbox": bbox,
+                    "font_size": statistics.median(sizes) if sizes else 0.0,
                     "rotation_degrees": cls._line_rotation(line),
                     "source_order": source_order,
                 }
@@ -579,6 +585,50 @@ class PDFParser:
                     key=lambda item: int(item["source_order"]),
                 )
             ]
+
+        # A short continuation line and the following section heading can be
+        # emitted as one PyMuPDF block when their boxes touch. Preserve their
+        # line-level font scales instead of rendering both at the block median.
+        # Consecutive lines of comparable size remain one wrapped paragraph.
+        style_groups: list[list[dict[str, object]]] = []
+        for line in sorted(
+            visual_lines,
+            key=lambda item: int(item["source_order"]),
+        ):
+            if not style_groups:
+                style_groups.append([line])
+                continue
+            previous = style_groups[-1][-1]
+            previous_size = float(previous.get("font_size", 0.0))
+            current_size = float(line.get("font_size", 0.0))
+            size_base = max(previous_size, current_size, 1.0)
+            if abs(previous_size - current_size) > max(2.0, size_base * 0.25):
+                style_groups.append([line])
+            else:
+                style_groups[-1].append(line)
+        if len(style_groups) > 1:
+            fragments: list[dict[str, object]] = []
+            for group in style_groups:
+                line_bboxes = [list(item["bbox"]) for item in group]
+                fragments.append(
+                    {
+                        "text": " ".join(str(item["text"]) for item in group),
+                        "spans": [
+                            span
+                            for item in group
+                            for span in list(item["spans"])
+                        ],
+                        "bbox": [
+                            round(min(box[0] for box in line_bboxes), 2),
+                            round(min(box[1] for box in line_bboxes), 2),
+                            round(max(box[2] for box in line_bboxes), 2),
+                            round(max(box[3] for box in line_bboxes), 2),
+                        ],
+                        "line_bboxes": line_bboxes,
+                        "rotation_degrees": cls._dominant_rotation(group),
+                    }
+                )
+            return fragments
 
         groups: list[list[dict[str, object]]] = []
         for line in sorted(visual_lines, key=lambda item: float(item["bbox"][0])):

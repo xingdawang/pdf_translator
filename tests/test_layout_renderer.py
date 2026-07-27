@@ -180,6 +180,95 @@ def test_layout_renderer_leaves_source_fallback_region_untouched(tmp_path):
     assert "MINERAL" in PdfReader(str(outputs.layout_pdf)).pages[0].extract_text()
 
 
+def test_layout_preflight_preserves_source_when_translation_cannot_fit(tmp_path):
+    source = _source_pdf(tmp_path / "source.pdf")
+    task = _task(source)
+    segment = task.segments[0]
+    segment.bbox = [24, 33, 36, 38]
+    segment.erase_bboxes = [[24, 33, 36, 38]]
+    segment.translated_text = "无法放进极小文本框的很长译文"
+    validation = ValidationReport(
+        task_id=task.task_id,
+        created_at=utc_now(),
+        total_segments=1,
+        translated_segments=1,
+        blocking_errors=0,
+        warnings=0,
+        issues=[],
+        can_generate=True,
+    )
+
+    outputs = LayoutPreservingRenderer(render_dpi=150).generate(
+        task,
+        validation,
+        tmp_path / "task",
+    )
+
+    report = json.loads(outputs.quality_json.read_text(encoding="utf-8"))
+    assert outputs.replaced_segments == 0
+    assert outputs.overflow_errors == 0
+    assert report["layout_fallback_segments"] == 1
+    assert report["layout_fallback_segment_ids"] == [segment.segment_id]
+    assert "MINERAL" in PdfReader(str(outputs.layout_pdf)).pages[0].extract_text()
+
+
+def test_layout_preflight_keeps_irregular_contour_instead_of_using_union_box(
+    tmp_path,
+):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    segment = task.segments[0]
+    segment.bbox = [24, 33, 170, 110]
+    segment.erase_bboxes = [
+        [120, 33, 170, 42],
+        [120, 45, 170, 54],
+        [24, 57, 170, 66],
+    ]
+    segment.translated_text = (
+        "这段译文非常长，无法沿着绕开图片的三行轮廓完整排入，"
+        "因此必须在擦除原文之前被安全检查识别出来。"
+        "即使外接矩形仍有空白，也不能越过逐行轮廓占用旁边的插图区域。"
+    )
+    renderer = LayoutPreservingRenderer()
+
+    fallbacks = renderer._layout_preflight_fallbacks(
+        [segment],
+        {segment.segment_id: segment.translated_text},
+        {segment.segment_id: []},
+    )
+
+    assert segment.segment_id in fallbacks
+
+
+def test_layout_preflight_draws_duplicate_compact_region_only_once(tmp_path):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    first = task.segments[0]
+    first.translated_text = "矿物指南"
+    first.erase_bboxes = [list(first.bbox)]
+    duplicate = replace(
+        first,
+        segment_id="P0001-S000002",
+        row_key="00000002",
+        reading_order=2,
+    )
+    renderer = LayoutPreservingRenderer()
+
+    fallbacks = renderer._layout_preflight_fallbacks(
+        [first, duplicate],
+        {
+            first.segment_id: first.translated_text,
+            duplicate.segment_id: duplicate.translated_text,
+        },
+        {
+            first.segment_id: [],
+            duplicate.segment_id: [],
+        },
+    )
+
+    assert first.segment_id not in fallbacks
+    assert duplicate.segment_id in fallbacks
+    assert "重复文本区域" in fallbacks[duplicate.segment_id]
+
+
 def test_narrow_multiline_column_is_not_mistaken_for_vertical_text(tmp_path):
     task = _task(_source_pdf(tmp_path / "source.pdf"))
     segment = task.segments[0]
@@ -315,6 +404,80 @@ def test_contour_line_break_does_not_split_ascii_number():
     assert consumed == len("食餐诞生于1953年")
 
 
+def test_contour_fit_avoids_orphan_closing_punctuation():
+    renderer = LayoutPreservingRenderer()
+    font_name, _ = renderer.font_resolver.register()
+    text = "三种比例尺的密西西比河地图（略微放大以便复制）。"
+    slots = [
+        [0, 0, 231, 9],
+        [0, 11, 65, 20],
+    ]
+
+    _, lines, fitted = renderer._fit_text_to_slots(
+        text,
+        slots,
+        font_name,
+        source_size=8.5,
+    )
+
+    assert fitted
+    assert not renderer._has_orphan_punctuation_line(lines)
+
+
+def test_short_lowercase_diagram_fragments_are_preserved(tmp_path):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    segment = task.segments[0]
+    segment.source_text = "or at q"
+    segment.translated_text = "或在 q"
+    segment.bbox = [24, 33, 55, 45]
+    segment.erase_bboxes = [list(segment.bbox)]
+    renderer = LayoutPreservingRenderer()
+
+    fallbacks = renderer._layout_preflight_fallbacks(
+        [segment],
+        {segment.segment_id: segment.translated_text},
+        {segment.segment_id: []},
+    )
+
+    assert segment.segment_id in fallbacks
+    assert "过短片段" in fallbacks[segment.segment_id]
+
+
+def test_rotated_compact_labels_with_axis_overlap_are_preserved(tmp_path):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    first = task.segments[0]
+    first.source_text = "Satellite track"
+    first.translated_text = "卫星轨迹"
+    first.bbox = [20, 20, 35, 70]
+    first.erase_bboxes = [list(first.bbox)]
+    first.rotation_degrees = 83
+    second = replace(
+        first,
+        segment_id="P0001-S000002",
+        row_key="00000002",
+        reading_order=2,
+        source_text="March 1st",
+        translated_text="3月1日",
+        bbox=[29, 25, 43, 68],
+        erase_bboxes=[[29, 25, 43, 68]],
+    )
+    renderer = LayoutPreservingRenderer()
+
+    fallbacks = renderer._layout_preflight_fallbacks(
+        [first, second],
+        {
+            first.segment_id: first.translated_text,
+            second.segment_id: second.translated_text,
+        },
+        {
+            first.segment_id: [],
+            second.segment_id: [],
+        },
+    )
+
+    assert set(fallbacks) == {first.segment_id, second.segment_id}
+
+
 def test_semantic_paragraph_translation_is_distributed_to_visual_anchors(
     tmp_path,
 ):
@@ -360,6 +523,48 @@ def test_semantic_paragraph_translation_is_distributed_to_visual_anchors(
         == segment.translated_text
     )
     assert all(item.paragraph_id == segment.segment_id for item in expanded)
+
+
+def test_visual_anchor_split_preserves_labels_when_identifier_would_break(tmp_path):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    segment = task.segments[0]
+    segment.source_text = "Sounded Nov. 19, 1937 R 602.5 OIL MILL"
+    segment.translated_text = "1937年11月19日测量，R 602.5 油厂"
+    segment.continuation = "visual_fragments"
+    segment.anchors = [
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A001",
+            page_number=1,
+            reading_order=1,
+            bbox=[20, 20, 90, 32],
+            source_text="Sounded Nov. 19, 1937",
+        ),
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A002",
+            page_number=1,
+            reading_order=2,
+            bbox=[70, 32, 95, 44],
+            source_text="R 602.5",
+        ),
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A003",
+            page_number=1,
+            reading_order=3,
+            bbox=[95, 44, 130, 56],
+            source_text="OIL MILL",
+        ),
+    ]
+
+    expanded = LayoutPreservingRenderer()._expand_visual_segments(
+        [segment],
+        ignore_number_warnings=True,
+    )
+
+    assert all(item.status == "source_fallback" for item in expanded)
+    assert [item.translated_text for item in expanded] == [
+        anchor.source_text for anchor in segment.anchors
+    ]
+    assert all("标识符" in item.fallback_reason for item in expanded)
 
 
 def test_short_translation_split_stays_near_source_weight_ratio():

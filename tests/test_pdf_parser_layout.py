@@ -73,6 +73,34 @@ def test_wrapped_paragraph_remains_one_block():
     assert fragments[0]["bbox"] == [40.0, 100.0, 300.0, 130.0]
 
 
+def test_touching_body_line_and_larger_heading_keep_separate_font_scales():
+    block = {
+        "type": 0,
+        "bbox": [40, 100, 220, 142],
+        "lines": [
+            {
+                "bbox": [70, 100, 115, 112],
+                "spans": [_span("the text.", [70, 100, 115, 112], size=10)],
+            },
+            {
+                "bbox": [40, 112, 220, 142],
+                "spans": [_span("Acknowledgments", [40, 112, 220, 142], size=18)],
+            },
+        ],
+    }
+
+    fragments = PDFParser.text_block_fragments(block)
+
+    assert [item["text"] for item in fragments] == [
+        "the text.",
+        "Acknowledgments",
+    ]
+    assert [item["bbox"] for item in fragments] == [
+        [70.0, 100.0, 115.0, 112.0],
+        [40.0, 112.0, 220.0, 142.0],
+    ]
+
+
 def test_rotated_block_keeps_visual_lines_independent_and_records_direction():
     block = {
         "type": 0,

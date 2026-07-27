@@ -36,7 +36,7 @@ from reportlab.platypus import Paragraph
 
 from .config import DEFAULT_DPI
 from .exceptions import ValidationBlockedError
-from .models import Segment, TranslationTask, ValidationReport
+from .models import ParagraphAnchor, Segment, TranslationTask, ValidationReport
 from .pdf_renderer import ChineseFontResolver
 from .pdf_parser import PDFParser
 from .placeholders import PlaceholderService
@@ -44,7 +44,7 @@ from .utils import atomic_write_json, normalize_whitespace, safe_stem, utc_now
 
 
 ProgressCallback = Callable[[int, int], None]
-LAYOUT_RENDERER_VERSION = "5.5.4-oriented-contour-ir"
+LAYOUT_RENDERER_VERSION = "5.6.3-safe-layout-preflight"
 PARALLEL_PAGE_THRESHOLD = 4
 MAX_REPAIR_TILES_PER_PAGE = 16
 PAGE_RENDER_QUEUE_MULTIPLIER = 2
@@ -127,6 +127,7 @@ class _PageRenderResult:
     dense_detail: dict[str, object] | None
     complex_backgrounds: int
     raster_base_image: _RepairImage | None
+    layout_fallbacks: dict[str, str]
 
 
 class LayoutPreservingRenderer:
@@ -563,6 +564,33 @@ class LayoutPreservingRenderer:
             )
             and self._translation_changes_source(segment)
         ]
+        replacement_texts: dict[str, str] = {}
+        for segment in page_segments:
+            restored = self.placeholders.restore(
+                segment.translated_text, segment.placeholders
+            )
+            if not self.placeholders.output_restore_ok(
+                restored,
+                segment.placeholders,
+                request.ignore_number_warnings,
+            ):
+                raise ValidationBlockedError(f"{segment.segment_id} 的占位符无法恢复。")
+            replacement_texts[segment.segment_id] = (
+                segment.source_text
+                if not self._contains_translatable_english(segment.source_text)
+                else restored.restored_text
+            )
+        layout_fallbacks = self._layout_preflight_fallbacks(
+            page_segments,
+            replacement_texts,
+            layout_fragments,
+            dense_cleanup=dense_cleanup is not None,
+        )
+        page_segments = [
+            segment
+            for segment in page_segments
+            if segment.segment_id not in layout_fallbacks
+        ]
         raster_page_segments = [
             segment for segment in page_segments if not self._is_vector_segment(segment)
         ]
@@ -603,16 +631,6 @@ class LayoutPreservingRenderer:
         prepared: list[_PreparedTranslation] = []
         complex_backgrounds = 0
         for segment in page_segments:
-            restored = self.placeholders.restore(
-                segment.translated_text, segment.placeholders
-            )
-            if not self.placeholders.output_restore_ok(
-                restored,
-                segment.placeholders,
-                request.ignore_number_warnings,
-            ):
-                raise ValidationBlockedError(f"{segment.segment_id} 的占位符无法恢复。")
-
             if self._is_vector_segment(segment):
                 background_mode = "vector-text-removal"
             elif dense_cleanup is not None:
@@ -642,15 +660,10 @@ class LayoutPreservingRenderer:
                     scale_y,
                 )
             )
-            replacement_text = (
-                segment.source_text
-                if not self._contains_translatable_english(segment.source_text)
-                else restored.restored_text
-            )
             prepared.append(
                 _PreparedTranslation(
                     segment=segment,
-                    text=replacement_text,
+                    text=replacement_texts[segment.segment_id],
                     text_color=color,
                     background_mode=background_mode,
                     fragments=layout_fragments[segment.segment_id],
@@ -702,6 +715,7 @@ class LayoutPreservingRenderer:
             dense_detail=dense_detail,
             complex_backgrounds=complex_backgrounds,
             raster_base_image=raster_base_image,
+            layout_fallbacks=layout_fallbacks,
         )
 
     def _generation_fingerprint(
@@ -1030,6 +1044,11 @@ class LayoutPreservingRenderer:
             item.dense_detail for item in page_results if item.dense_detail is not None
         ]
         complex_backgrounds = sum(item.complex_backgrounds for item in page_results)
+        layout_fallbacks = {
+            segment_id: reason
+            for page_result in page_results
+            for segment_id, reason in page_result.layout_fallbacks.items()
+        }
         try:
             for page_result in page_results:
                 overlay.setPageSize((page_result.width, page_result.height))
@@ -1174,6 +1193,17 @@ class LayoutPreservingRenderer:
             "source_fallback_segment_ids": [
                 segment.segment_id for segment in task.source_fallback_segments
             ],
+            "visual_source_fallback_segments": sum(
+                segment.status == "source_fallback" for segment in render_segments
+            ),
+            "visual_source_fallback_segment_ids": [
+                segment.segment_id
+                for segment in render_segments
+                if segment.status == "source_fallback"
+            ],
+            "layout_fallback_segments": len(layout_fallbacks),
+            "layout_fallback_segment_ids": sorted(layout_fallbacks),
+            "layout_fallback_reasons": layout_fallbacks,
             "overflow_errors": len(overflow),
             "overflow_segment_ids": [item.segment_id for item in overflow],
             "source_bbox_overlap_warnings": len(overlap_pairs),
@@ -1220,13 +1250,15 @@ class LayoutPreservingRenderer:
                 or not verified["page_sizes_preserved"]
                 or dense_page_details
                 else "passed_with_warnings"
-                if overlap_pairs or validation.warnings
+                if overlap_pairs or validation.warnings or layout_fallbacks
                 else "passed"
             ),
             "note": (
                 "原 PDF 页面作为底图原样保留；仅在 OCR 行坐标处修补背景并写入中文。"
                 "多行中文沿原英文逐行轮廓排入，以保留绕图和缩进区域。"
                 "扫描页使用英文笔画掩膜和局部图像修复；照片上的文字仍需逐页肉眼抽查。"
+                "译文若无法在原始逐行轮廓内完整容纳，或与相邻紧凑标签冲突，"
+                "会在擦除前自动保留原文。"
                 "高密度索引或目录页会被单独标为 needs_review，不能仅凭零溢出判定通过。"
             ),
         }
@@ -1256,6 +1288,7 @@ class LayoutPreservingRenderer:
                 expanded.append(segment)
                 continue
             source_label_indexes: set[int] = set()
+            visual_fallback_reason = "独立短标签未与正文译文混排"
             if segment.status == "source_fallback":
                 chunks = [
                     anchor.source_text or segment.source_text for anchor in anchors
@@ -1302,6 +1335,22 @@ class LayoutPreservingRenderer:
                     )
                     for index, anchor in enumerate(anchors)
                 ]
+                if (
+                    self._is_compact_visual_anchor_group(anchors)
+                    and not self._visual_anchor_split_is_safe(
+                        restored.restored_text,
+                        anchors,
+                        chunks,
+                    )
+                ):
+                    source_label_indexes = set(range(len(anchors)))
+                    chunks = [
+                        anchor.source_text or segment.source_text
+                        for anchor in anchors
+                    ]
+                    visual_fallback_reason = (
+                        "跨视觉锚点拆分会破坏数字或标识符，已保留原标签"
+                    )
             for index, (anchor, chunk) in enumerate(
                 zip(anchors, chunks, strict=True),
                 start=1,
@@ -1323,7 +1372,7 @@ class LayoutPreservingRenderer:
                             else segment.status
                         ),
                         fallback_reason=(
-                            "独立短标签未与正文译文混排"
+                            visual_fallback_reason
                             if preserve_source_label
                             else segment.fallback_reason
                         ),
@@ -1340,6 +1389,44 @@ class LayoutPreservingRenderer:
                     )
                 )
         return expanded
+
+    @staticmethod
+    def _is_compact_visual_anchor_group(
+        anchors: list[ParagraphAnchor],
+    ) -> bool:
+        return bool(
+            1 < len(anchors) <= 6
+            and all(
+                len(normalize_whitespace(anchor.source_text)) <= 48
+                and len(normalize_whitespace(anchor.source_text).split()) <= 8
+                for anchor in anchors
+            )
+        )
+
+    @classmethod
+    def _visual_anchor_split_is_safe(
+        cls,
+        full_translation: str,
+        anchors: list[ParagraphAnchor],
+        chunks: list[str],
+    ) -> bool:
+        """Ensure a number/identifier is not split across visual anchors."""
+
+        full = full_translation.casefold()
+        anchor_identifiers = [
+            cls._layout_anchors(anchor.source_text) for anchor in anchors
+        ]
+        owners: dict[str, set[int]] = {}
+        for index, identifiers in enumerate(anchor_identifiers):
+            for identifier in identifiers:
+                owners.setdefault(identifier, set()).add(index)
+        for identifier, identifier_owners in owners.items():
+            if len(identifier_owners) != 1 or identifier not in full:
+                continue
+            owner = next(iter(identifier_owners))
+            if identifier not in chunks[owner].casefold():
+                return False
+        return True
 
     @staticmethod
     def _is_short_visual_label(text: str) -> bool:
@@ -1961,6 +2048,45 @@ class LayoutPreservingRenderer:
         text_color: tuple[float, float, float],
         background_mode: str,
     ) -> _Placement:
+        fragment_placements: list[_Placement] = []
+        for fragment_segment, chunk in self._fragment_translation_segments(
+            segment,
+            text,
+            fragments,
+        ):
+            fragment_placements.append(
+                self._draw_translation(
+                    pdf_canvas,
+                    fragment_segment,
+                    chunk,
+                    page_height,
+                    font_name,
+                    text_color,
+                    background_mode,
+                )
+            )
+        return _Placement(
+            segment_id=segment.segment_id,
+            page_number=segment.page_number,
+            bbox=list(segment.bbox),
+            font_size=round(min(item.font_size for item in fragment_placements), 2),
+            source_font_size=round(
+                min(item.source_font_size for item in fragment_placements), 2
+            ),
+            rotated=any(item.rotated for item in fragment_placements),
+            contour_flow=any(item.contour_flow for item in fragment_placements),
+            fitted=all(item.fitted for item in fragment_placements),
+            background_mode=background_mode + "-fragmented",
+        )
+
+    def _fragment_translation_segments(
+        self,
+        segment: Segment,
+        text: str,
+        fragments: list[_LayoutFragment],
+    ) -> list[tuple[Segment, str]]:
+        """Return the exact fragment geometry shared by preflight and drawing."""
+
         chunks = self._partition_translation(text, fragments)
         if len(chunks) != len(fragments):
             chunks = self._split_text_across_anchors(
@@ -1968,7 +2094,7 @@ class LayoutPreservingRenderer:
                 [fragment.source_text for fragment in fragments],
             )
 
-        fragment_placements: list[_Placement] = []
+        items: list[tuple[Segment, str]] = []
         for index, (fragment, chunk) in enumerate(zip(fragments, chunks)):
             draw_bbox = list(fragment.bbox)
             fragment_is_rotated = abs(fragment.rotation_degrees) >= 3.0
@@ -1995,46 +2121,285 @@ class LayoutPreservingRenderer:
                     if is_numbered_label_pair
                     else 3.0
                 )
-            fragment_segment = replace(
-                segment,
-                source_text=fragment.source_text,
-                bbox=draw_bbox,
-                erase_bboxes=[
-                    list(box)
-                    for box in (
-                        fragment.line_bboxes
-                        if len(fragment.line_bboxes) > 1
-                        else [draw_bbox]
-                    )
-                ],
-                font_size=fragment.font_size or segment.font_size,
-                rotation_degrees=fragment.rotation_degrees,
-                source_kind="pdf_text",
-            )
-            fragment_placements.append(
-                self._draw_translation(
-                    pdf_canvas,
-                    fragment_segment,
+            items.append(
+                (
+                    replace(
+                        segment,
+                        source_text=fragment.source_text,
+                        bbox=draw_bbox,
+                        erase_bboxes=[
+                            list(box)
+                            for box in (
+                                fragment.line_bboxes
+                                if len(fragment.line_bboxes) > 1
+                                else [draw_bbox]
+                            )
+                        ],
+                        font_size=fragment.font_size or segment.font_size,
+                        rotation_degrees=fragment.rotation_degrees,
+                        source_kind="pdf_text",
+                    ),
                     chunk,
-                    page_height,
-                    font_name,
-                    text_color,
-                    background_mode,
                 )
             )
-        return _Placement(
-            segment_id=segment.segment_id,
-            page_number=segment.page_number,
-            bbox=list(segment.bbox),
-            font_size=round(min(item.font_size for item in fragment_placements), 2),
-            source_font_size=round(
-                min(item.source_font_size for item in fragment_placements), 2
-            ),
-            rotated=any(item.rotated for item in fragment_placements),
-            contour_flow=any(item.contour_flow for item in fragment_placements),
-            fitted=all(item.fitted for item in fragment_placements),
-            background_mode=background_mode + "-fragmented",
+        return items
+
+    def _layout_preflight_fallbacks(
+        self,
+        segments: list[Segment],
+        replacement_texts: dict[str, str],
+        layout_fragments: dict[str, list[_LayoutFragment]],
+        *,
+        dense_cleanup: bool = False,
+    ) -> dict[str, str]:
+        """Reject unsafe replacements before any source glyph is removed.
+
+        Fitting uses the same font, contours, fragment partitioning, and
+        oriented geometry as final drawing. Compact labels also receive an
+        oriented collision pass; this catches dense maps and diagrams without
+        treating the union boxes of ordinary wrap-around paragraphs as solid
+        rectangles.
+        """
+
+        font_name, _ = self.font_resolver.register()
+        fallbacks: dict[str, str] = {}
+        compact_regions: list[
+            tuple[str, str, np.ndarray, float, list[float], bool]
+        ] = []
+        for segment in segments:
+            text = replacement_texts[segment.segment_id]
+            if self._is_fragmentary_compact_label(segment):
+                fallbacks[segment.segment_id] = (
+                    "疑似图中单词被拆成过短片段，保留原文以避免逐片误译"
+                )
+                continue
+            fragments = layout_fragments.get(segment.segment_id, [])
+            parts = (
+                self._fragment_translation_segments(segment, text, fragments)
+                if len(fragments) > 1
+                else [(segment, text)]
+            )
+            for part, chunk in parts:
+                fitted = self._translation_fits_segment(
+                    part,
+                    chunk,
+                    font_name,
+                    dense_cleanup=dense_cleanup,
+                )
+                if not fitted:
+                    fallbacks[segment.segment_id] = (
+                        "译文无法完整容纳于原始逐行轮廓或旋转文本框"
+                    )
+                    break
+                if self._is_compact_label(part):
+                    polygon = self._oriented_segment_polygon(part)
+                    compact_regions.append(
+                        (
+                            segment.segment_id,
+                            normalize_whitespace(part.source_text).casefold(),
+                            polygon,
+                            abs(float(cv2.contourArea(polygon))),
+                            [float(value) for value in part.bbox],
+                            self._is_rotated_segment(part, chunk),
+                        )
+                    )
+
+        for index, first in enumerate(compact_regions):
+            (
+                first_id,
+                first_source,
+                first_polygon,
+                first_area,
+                first_bbox,
+                first_rotated,
+            ) = first
+            for second in compact_regions[index + 1 :]:
+                (
+                    second_id,
+                    second_source,
+                    second_polygon,
+                    second_area,
+                    second_bbox,
+                    second_rotated,
+                ) = second
+                if first_id == second_id:
+                    continue
+                intersection_area, _ = cv2.intersectConvexConvex(
+                    first_polygon,
+                    second_polygon,
+                )
+                smaller_area = min(first_area, second_area)
+                axis_overlap_ratio = self._bbox_overlap_ratio(
+                    first_bbox,
+                    second_bbox,
+                )
+                if (
+                    smaller_area <= 0.1
+                    or float(intersection_area) / smaller_area < 0.08
+                ) and not (
+                    (first_rotated or second_rotated)
+                    and axis_overlap_ratio >= 0.15
+                ):
+                    continue
+                if first_source and first_source == second_source:
+                    # Duplicate OCR/vector detections should be replaced once,
+                    # not drawn twice. Keep the first reading-order candidate.
+                    fallbacks.setdefault(
+                        second_id,
+                        "重复文本区域已由同页较早片段处理",
+                    )
+                    continue
+                fallbacks.setdefault(
+                    first_id,
+                    "紧凑标签的旋转文本区域与相邻标签冲突",
+                )
+                fallbacks.setdefault(
+                    second_id,
+                    "紧凑标签的旋转文本区域与相邻标签冲突",
+                )
+        return fallbacks
+
+    @staticmethod
+    def _bbox_overlap_ratio(first: list[float], second: list[float]) -> float:
+        width = max(0.0, min(first[2], second[2]) - max(first[0], second[0]))
+        height = max(0.0, min(first[3], second[3]) - max(first[1], second[1]))
+        intersection = width * height
+        first_area = max(0.0, first[2] - first[0]) * max(
+            0.0, first[3] - first[1]
         )
+        second_area = max(0.0, second[2] - second[0]) * max(
+            0.0, second[3] - second[1]
+        )
+        return intersection / max(min(first_area, second_area), 0.01)
+
+    def _translation_fits_segment(
+        self,
+        segment: Segment,
+        text: str,
+        font_name: str,
+        *,
+        dense_cleanup: bool,
+    ) -> bool:
+        x0, y0, x1, y1 = [float(value) for value in segment.bbox]
+        width = max(x1 - x0, 1.0)
+        height = max(y1 - y0, 1.0)
+        minimum_draw_height = self.minimum_font_size * 1.20
+        if len(segment.erase_bboxes or [segment.bbox]) == 1:
+            height = max(height, minimum_draw_height)
+
+        is_index_marker = bool(
+            re.fullmatch(r"[A-Z]", normalize_whitespace(segment.source_text))
+        )
+        effective_block_type = (
+            "paragraph"
+            if dense_cleanup and not is_index_marker
+            else segment.block_type
+        )
+        rotation_degrees = self._segment_rotation(segment, text)
+        rotated = abs(rotation_degrees) >= 3.0
+        contour_flow = (
+            not rotated
+            and len(segment.erase_bboxes) > 1
+            and (
+                effective_block_type not in {"title", "heading"}
+                or self._has_irregular_line_contour(segment.erase_bboxes)
+            )
+        )
+        source_size = self._source_font_size(segment)
+        if dense_cleanup and not is_index_marker:
+            source_size = min(
+                source_size,
+                max(7.5, self.minimum_font_size * 2.15),
+            )
+        if contour_flow:
+            slots = sorted(
+                (
+                    [float(value) for value in box]
+                    for box in segment.erase_bboxes
+                    if len(box) == 4
+                    and float(box[2]) > float(box[0])
+                    and float(box[3]) > float(box[1])
+                ),
+                key=lambda box: (box[1], box[0]),
+            )
+            _, _, fitted = self._fit_text_to_slots(
+                text,
+                slots,
+                font_name,
+                source_size,
+            )
+            return fitted
+
+        if rotated:
+            width, height = self._oriented_box_dimensions(
+                width,
+                height,
+                rotation_degrees,
+                source_size,
+            )
+            height = self._rotated_single_line_height(
+                text,
+                width,
+                height,
+                font_name,
+                self.minimum_font_size,
+            )
+        _, _, _, fitted = self._fit_paragraph(
+            text,
+            width,
+            height,
+            font_name,
+            source_size,
+            (0.0, 0.0, 0.0),
+            effective_block_type,
+        )
+        return fitted
+
+    @staticmethod
+    def _is_compact_label(segment: Segment) -> bool:
+        source = normalize_whitespace(segment.source_text)
+        return bool(
+            len(segment.erase_bboxes or [segment.bbox]) == 1
+            and 0 < len(source) <= 48
+            and len(source.split()) <= 8
+            and "\n" not in source
+            and not re.search(r"[!?;。！？；]$", source)
+        )
+
+    @classmethod
+    def _is_fragmentary_compact_label(cls, segment: Segment) -> bool:
+        if not cls._is_compact_label(segment):
+            return False
+        source = normalize_whitespace(segment.source_text)
+        if not re.fullmatch(r"[A-Za-z ]+", source):
+            return False
+        tokens = source.split()
+        letter_count = len(source.replace(" ", ""))
+        return bool(
+            tokens
+            and letter_count <= 6
+            and all(len(token) <= 2 for token in tokens)
+        )
+
+    @classmethod
+    def _oriented_segment_polygon(cls, segment: Segment) -> np.ndarray:
+        x0, y0, x1, y1 = [float(value) for value in segment.bbox]
+        center = ((x0 + x1) * 0.5, (y0 + y1) * 0.5)
+        rotation = cls._segment_rotation(segment, segment.translated_text)
+        if abs(rotation) < 3.0:
+            return np.asarray(
+                [[x0, y0], [x1, y0], [x1, y1], [x0, y1]],
+                dtype=np.float32,
+            )
+        length, thickness = cls._oriented_box_dimensions(
+            max(x1 - x0, 1.0),
+            max(y1 - y0, 1.0),
+            rotation,
+            cls._source_font_size(segment),
+        )
+        return cv2.boxPoints(
+            (center, (float(length), float(thickness)), float(rotation))
+        ).astype(np.float32)
 
     @classmethod
     def _partition_translation(
@@ -2580,6 +2945,7 @@ class LayoutPreservingRenderer:
             min(34.0, source_size * 1.02),
         )
         last_lines: list[str] = []
+        first_fitted: tuple[float, list[str]] | None = None
         while size >= self.minimum_font_size - 0.01:
             lines, consumed = self._pack_text_into_slots(
                 text,
@@ -2589,9 +2955,25 @@ class LayoutPreservingRenderer:
             )
             last_lines = lines
             if consumed >= len(text.rstrip()):
-                return size, lines, True
+                if first_fitted is None:
+                    first_fitted = (size, lines)
+                if not self._has_orphan_punctuation_line(lines):
+                    return size, lines, True
             size -= 0.25
+        if first_fitted is not None:
+            return first_fitted[0], first_fitted[1], True
         return self.minimum_font_size, last_lines, False
+
+    @staticmethod
+    def _has_orphan_punctuation_line(lines: list[str]) -> bool:
+        nonempty = [line.strip() for line in lines if line.strip()]
+        return bool(
+            len(nonempty) >= 2
+            and re.fullmatch(
+                r"[)\]}>）】》」』〕〉.,，。！？!?；;：:、]+",
+                nonempty[-1],
+            )
+        )
 
     @classmethod
     def _pack_text_into_slots(
