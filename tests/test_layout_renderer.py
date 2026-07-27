@@ -6,7 +6,7 @@ import fitz
 import numpy as np
 import pytest
 from PIL import Image
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from reportlab.lib.colors import HexColor
 from reportlab.pdfgen import canvas
 
@@ -114,6 +114,60 @@ def test_layout_renderer_preserves_page_and_reports_fit(tmp_path):
     assert report["repair_image_tiles"] == 0
     assert report["vector_text_redactions"] >= 1
     assert outputs.quality_html.exists()
+
+
+def test_layout_renderer_aligns_overlay_to_nonzero_cropbox(tmp_path):
+    source = _source_pdf(tmp_path / "source-with-cropbox.pdf")
+    reader = PdfReader(str(source))
+    source_page = reader.pages[0]
+    source_page.cropbox.lower_left = (20, 15)
+    source_page.cropbox.upper_right = (280, 185)
+    cropped_source = tmp_path / "cropped-source.pdf"
+    writer = PdfWriter()
+    writer.add_page(source_page)
+    with cropped_source.open("wb") as stream:
+        writer.write(stream)
+
+    task = _task(cropped_source)
+    task.segments[0] = replace(
+        task.segments[0],
+        # Coordinates exposed by PyMuPDF are local to the 260 x 170 CropBox.
+        bbox=[4, 18, 145, 55],
+        erase_bboxes=[[4, 18, 70, 35], [4, 37, 145, 55]],
+    )
+    validation = ValidationReport(
+        task_id=task.task_id,
+        created_at=utc_now(),
+        total_segments=1,
+        translated_segments=1,
+        blocking_errors=0,
+        warnings=0,
+        issues=[],
+        can_generate=True,
+    )
+
+    outputs = LayoutPreservingRenderer(render_dpi=150).generate(
+        task,
+        validation,
+        tmp_path / "task-with-cropbox",
+    )
+
+    with fitz.open(outputs.layout_pdf) as document:
+        page = document[0]
+        assert tuple(page.cropbox) == pytest.approx((20, 15, 280, 185))
+        chinese_spans = [
+            span
+            for block in page.get_text("dict", sort=True)["blocks"]
+            if block.get("type") == 0
+            for line in block.get("lines", [])
+            for span in line.get("spans", [])
+            if any("\u3400" <= character <= "\u9fff" for character in span["text"])
+        ]
+    assert chinese_spans
+    # A MediaBox-local overlay would be exposed at x=-16 and y=3 after the
+    # CropBox is applied. The replacement must stay in its CropBox-local slot.
+    assert min(span["bbox"][0] for span in chinese_spans) == pytest.approx(4, abs=1)
+    assert min(span["bbox"][1] for span in chinese_spans) >= 17
 
 
 def test_layout_renderer_allows_google_changed_number_unit_placeholder(tmp_path):
@@ -523,6 +577,99 @@ def test_semantic_paragraph_translation_is_distributed_to_visual_anchors(
         == segment.translated_text
     )
     assert all(item.paragraph_id == segment.segment_id for item in expanded)
+
+
+def test_visual_caption_title_stays_with_its_own_anchor(tmp_path):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    segment = task.segments[0]
+    segment.source_text = (
+        "I.11 Graphic scales on a topographic map "
+        "A portion of a modern, large-scale topographic map, "
+        "for which three graphic scales have been provided."
+    )
+    segment.translated_text = (
+        "I.11 地形图上的图形比例尺 "
+        "现代大比例尺地形图的一部分，提供了三个图形比例尺。"
+    )
+    segment.continuation = "visual_fragments"
+    segment.anchors = [
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A001",
+            page_number=1,
+            reading_order=1,
+            bbox=[20, 20, 180, 32],
+            source_text="I.11 Graphic scales on a topographic map",
+        ),
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A002",
+            page_number=1,
+            reading_order=2,
+            bbox=[20, 38, 280, 50],
+            source_text=(
+                "A portion of a modern, large-scale topographic map, "
+                "for which three graphic scales have been provided."
+            ),
+        ),
+    ]
+
+    expanded = LayoutPreservingRenderer()._expand_visual_segments(
+        [segment],
+        ignore_number_warnings=True,
+    )
+
+    assert [item.translated_text for item in expanded] == [
+        "I.11 地形图上的图形比例尺",
+        "现代大比例尺地形图的一部分，提供了三个图形比例尺。",
+    ]
+
+
+def test_cross_page_figure_identifier_stays_with_following_heading(tmp_path):
+    task = _task(_source_pdf(tmp_path / "source.pdf"))
+    segment = task.segments[0]
+    segment.source_text = (
+        "Figure I.12 shows symbols applied to a map. "
+        "I.13 Map scale and information content "
+        "Maps of a river on three scales."
+    )
+    segment.translated_text = (
+        "图 I.12 显示了应用于地图的符号。"
+        "I.13 地图比例尺和信息内容 三种比例尺的河流地图。"
+    )
+    segment.continuation = "cross_page"
+    segment.anchors = [
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A001",
+            page_number=1,
+            reading_order=1,
+            bbox=[20, 120, 280, 150],
+            source_text="Figure I.12 shows symbols applied to a map.",
+        ),
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A002",
+            page_number=2,
+            reading_order=1,
+            bbox=[20, 20, 200, 32],
+            source_text="I.13 Map scale and information content",
+        ),
+        ParagraphAnchor(
+            anchor_id=f"{segment.segment_id}-A003",
+            page_number=2,
+            reading_order=2,
+            bbox=[20, 38, 280, 50],
+            source_text="Maps of a river on three scales.",
+        ),
+    ]
+
+    expanded = LayoutPreservingRenderer()._expand_visual_segments(
+        [segment],
+        ignore_number_warnings=True,
+    )
+
+    assert [item.translated_text for item in expanded] == [
+        "图 I.12 显示了应用于地图的符号。",
+        "I.13 地图比例尺和信息内容",
+        "三种比例尺的河流地图。",
+    ]
 
 
 def test_visual_anchor_split_preserves_labels_when_identifier_would_break(tmp_path):

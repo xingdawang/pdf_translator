@@ -44,7 +44,7 @@ from .utils import atomic_write_json, normalize_whitespace, safe_stem, utc_now
 
 
 ProgressCallback = Callable[[int, int], None]
-LAYOUT_RENDERER_VERSION = "5.6.3-safe-layout-preflight"
+LAYOUT_RENDERER_VERSION = "5.7.1-cropbox-anchor-alignment"
 PARALLEL_PAGE_THRESHOLD = 4
 MAX_REPAIR_TILES_PER_PAGE = 16
 PAGE_RENDER_QUEUE_MULTIPLIER = 2
@@ -101,8 +101,12 @@ class _LayoutFragment:
 class _PageRenderRequest:
     selected_index: int
     page_number: int
+    media_width: float
+    media_height: float
     width: float
     height: float
+    offset_x: float
+    offset_y: float
     segments: list[Segment]
     ignore_number_warnings: bool
 
@@ -117,8 +121,12 @@ class _RepairImage:
 class _PageRenderResult:
     selected_index: int
     page_number: int
+    media_width: float
+    media_height: float
     width: float
     height: float
+    offset_x: float
+    offset_y: float
     repair_images: list[_RepairImage]
     dense_cleanup: tuple[list[float], tuple[float, float, float]] | None
     prepared: list[_PreparedTranslation]
@@ -705,8 +713,12 @@ class LayoutPreservingRenderer:
         return _PageRenderResult(
             selected_index=request.selected_index,
             page_number=request.page_number,
+            media_width=request.media_width,
+            media_height=request.media_height,
             width=request.width,
             height=request.height,
+            offset_x=request.offset_x,
+            offset_y=request.offset_y,
             repair_images=repair_images,
             dense_cleanup=dense_cleanup,
             prepared=prepared,
@@ -1002,12 +1014,23 @@ class LayoutPreservingRenderer:
         requests = []
         for selected_index, page_number in enumerate(page_numbers, start=1):
             source_page = source_reader.pages[page_number - 1]
+            media_box = source_page.mediabox
+            crop_box = source_page.cropbox
             requests.append(
                 _PageRenderRequest(
                     selected_index=selected_index,
                     page_number=page_number,
-                    width=float(source_page.mediabox.width),
-                    height=float(source_page.mediabox.height),
+                    media_width=float(media_box.width),
+                    media_height=float(media_box.height),
+                    # PyMuPDF returns text and image coordinates relative to
+                    # the visible CropBox, while a ReportLab overlay is merged
+                    # in the full MediaBox coordinate system. Keep all layout
+                    # and raster work in CropBox-local coordinates, then move
+                    # the finished overlay onto the CropBox at assembly time.
+                    width=float(crop_box.width),
+                    height=float(crop_box.height),
+                    offset_x=float(crop_box.left) - float(media_box.left),
+                    offset_y=float(crop_box.bottom) - float(media_box.bottom),
                     segments=segments_by_page.get(page_number, []),
                     ignore_number_warnings=(task.settings.ignore_number_warnings),
                 )
@@ -1051,7 +1074,11 @@ class LayoutPreservingRenderer:
         }
         try:
             for page_result in page_results:
-                overlay.setPageSize((page_result.width, page_result.height))
+                overlay.setPageSize(
+                    (page_result.media_width, page_result.media_height)
+                )
+                overlay.saveState()
+                overlay.translate(page_result.offset_x, page_result.offset_y)
                 if page_result.raster_base_image is not None:
                     raster_base = page_result.raster_base_image
                     x0, y0, x1, y1 = raster_base.bbox
@@ -1107,6 +1134,7 @@ class LayoutPreservingRenderer:
                         )
                     placements.append(placement)
 
+                overlay.restoreState()
                 overlay.showPage()
         finally:
             overlay.save()
@@ -1320,10 +1348,16 @@ class LayoutPreservingRenderer:
                 if not content_indexes:
                     source_label_indexes.clear()
                     content_indexes = list(range(len(anchors)))
-                content_chunks = self._split_text_across_anchors(
+                content_anchors = [anchors[index] for index in content_indexes]
+                content_chunks = self._partition_visual_anchor_translation(
                     restored.restored_text,
-                    [anchors[index].source_text for index in content_indexes],
+                    content_anchors,
                 )
+                if len(content_chunks) != len(content_anchors):
+                    content_chunks = self._split_text_across_anchors(
+                        restored.restored_text,
+                        [anchor.source_text for anchor in content_anchors],
+                    )
                 translated_by_index = dict(
                     zip(content_indexes, content_chunks, strict=True)
                 )
@@ -1436,6 +1470,44 @@ class LayoutPreservingRenderer:
             and len(normalized.split()) <= 5
             and re.fullmatch(r"[A-Z][A-Z0-9 /&+.-]*", normalized)
         )
+
+    @classmethod
+    def _partition_visual_anchor_translation(
+        cls,
+        text: str,
+        anchors: list[ParagraphAnchor],
+    ) -> list[str]:
+        """Keep captions, headings, and cross-page identifiers with their slots.
+
+        Semantic extraction intentionally joins visual fragments so translators
+        receive complete paragraphs. When projecting the translation back, a
+        plain character ratio can cut a caption title in half or move a figure
+        identifier to the preceding page. The token-aware partitioner already
+        understands unique identifiers and source proportions, so reuse it for
+        paragraph-like anchor groups. Very small diagram-label groups retain
+        the stricter source-preservation path below.
+        """
+
+        if len(anchors) < 2 or cls._is_compact_visual_anchor_group(anchors):
+            return []
+        partition_text = re.sub(
+            r"(?<=[。！？；!?;])(?=(?:图\s*)?[A-Za-z]*\d)",
+            " ",
+            text.strip(),
+        )
+        fragments = [
+            _LayoutFragment(
+                source_text=anchor.source_text,
+                bbox=list(anchor.bbox),
+                font_size=0.0,
+                line_bboxes=[
+                    list(box) for box in (anchor.erase_bboxes or [anchor.bbox])
+                ],
+                rotation_degrees=anchor.rotation_degrees,
+            )
+            for anchor in anchors
+        ]
+        return cls._partition_translation(partition_text, fragments)
 
     @staticmethod
     def _split_text_across_anchors(
