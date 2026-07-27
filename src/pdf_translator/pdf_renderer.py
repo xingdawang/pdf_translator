@@ -35,6 +35,16 @@ from .utils import atomic_write_json, safe_stem, utc_now
 
 ProgressCallback = Callable[[int, int], None]
 _FONT_REGISTRATION_LOCK = threading.Lock()
+SYSTEM_CJK_FONT_PATHS = (
+    Path("/System/Library/Fonts/STHeiti Light.ttc"),
+    Path("/System/Library/Fonts/STHeiti Medium.ttc"),
+    Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
+    Path("/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
+    Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
+    Path("C:/Windows/Fonts/msyh.ttc"),
+    Path("C:/Windows/Fonts/simhei.ttf"),
+)
 
 
 @dataclass
@@ -64,13 +74,7 @@ class ChineseFontResolver:
             if os.getenv("PDF_TRANSLATOR_FONT")
             else None,
             Path(__file__).resolve().parent / "assets" / "NotoSansCJKsc-Regular.otf",
-            Path("/System/Library/Fonts/STHeiti Light.ttc"),
-            Path("/System/Library/Fonts/STHeiti Medium.ttc"),
-            Path("/System/Library/Fonts/Supplemental/Arial Unicode.ttf"),
-            Path("/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc"),
-            Path("/usr/share/fonts/opentype/noto/NotoSansCJKsc-Regular.otf"),
-            Path("C:/Windows/Fonts/msyh.ttc"),
-            Path("C:/Windows/Fonts/simhei.ttf"),
+            *SYSTEM_CJK_FONT_PATHS,
         ]
         for candidate in candidates:
             if candidate and candidate.is_file():
