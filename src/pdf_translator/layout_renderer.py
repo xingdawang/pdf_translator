@@ -8,7 +8,9 @@ import multiprocessing
 import os
 import re
 import shutil
+import subprocess
 import threading
+import uuid
 from concurrent.futures import (
     ProcessPoolExecutor,
     ThreadPoolExecutor,
@@ -16,6 +18,7 @@ from concurrent.futures import (
 )
 from concurrent.futures.process import BrokenProcessPool
 from dataclasses import dataclass, field, replace
+from itertools import islice
 from pathlib import Path
 from typing import Callable
 
@@ -31,6 +34,7 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfgen import canvas
 from reportlab.platypus import Paragraph
 
+from .config import DEFAULT_DPI
 from .exceptions import ValidationBlockedError
 from .models import Segment, TranslationTask, ValidationReport
 from .pdf_renderer import ChineseFontResolver
@@ -40,9 +44,10 @@ from .utils import atomic_write_json, normalize_whitespace, safe_stem, utc_now
 
 
 ProgressCallback = Callable[[int, int], None]
-LAYOUT_RENDERER_VERSION = "5.1.2-compact-repair-layers"
+LAYOUT_RENDERER_VERSION = "5.5.4-oriented-contour-ir"
 PARALLEL_PAGE_THRESHOLD = 4
 MAX_REPAIR_TILES_PER_PAGE = 16
+PAGE_RENDER_QUEUE_MULTIPLIER = 2
 
 # PDF streams are binary-safe. ASCII85 adds roughly 25% transport overhead to
 # every raster repair layer without improving compatibility for the files we
@@ -89,6 +94,7 @@ class _LayoutFragment:
     bbox: list[float]
     font_size: float
     line_bboxes: list[list[float]] = field(default_factory=list)
+    rotation_degrees: float = 0.0
 
 
 @dataclass
@@ -120,6 +126,7 @@ class _PageRenderResult:
     mask_ratio: float
     dense_detail: dict[str, object] | None
     complex_backgrounds: int
+    raster_base_image: _RepairImage | None
 
 
 class LayoutPreservingRenderer:
@@ -128,12 +135,12 @@ class LayoutPreservingRenderer:
     def __init__(
         self,
         font_path: str | Path | None = None,
-        render_dpi: int = 170,
+        render_dpi: int = DEFAULT_DPI,
         minimum_font_size: float = 3.5,
         max_workers: int | None = None,
     ):
         self.font_resolver = ChineseFontResolver(font_path)
-        self.render_dpi = max(120, min(300, int(render_dpi)))
+        self.render_dpi = int(render_dpi)
         self.minimum_font_size = minimum_font_size
         self.max_workers = max_workers
         self.placeholders = PlaceholderService()
@@ -168,9 +175,7 @@ class LayoutPreservingRenderer:
             results: list[_PageRenderResult] = []
             try:
                 for request in requests:
-                    results.append(
-                        self._prepare_page(document, request, temp_dir)
-                    )
+                    results.append(self._prepare_page(document, request, temp_dir))
                     if progress:
                         progress(len(results), len(requests))
             finally:
@@ -191,18 +196,30 @@ class LayoutPreservingRenderer:
                     str(temp_dir),
                 ),
             ) as pool:
-                futures = {
-                    pool.submit(
-                        _render_page_worker, request
-                    ): request.selected_index
-                    for request in requests
-                }
-                for completed, future in enumerate(
-                    as_completed(futures), start=1
+                request_iterator = iter(requests)
+                futures = {}
+                for request in islice(
+                    request_iterator,
+                    worker_count * PAGE_RENDER_QUEUE_MULTIPLIER,
                 ):
+                    futures[pool.submit(_render_page_worker, request)] = (
+                        request.selected_index
+                    )
+                completed = 0
+                while futures:
+                    future = next(as_completed(futures))
+                    futures.pop(future)
                     results.append(future.result())
+                    completed += 1
                     if progress:
                         progress(completed, len(requests))
+                    try:
+                        request = next(request_iterator)
+                    except StopIteration:
+                        continue
+                    futures[pool.submit(_render_page_worker, request)] = (
+                        request.selected_index
+                    )
             results.sort(key=lambda item: item.selected_index)
             return results, worker_count, "process"
         except (
@@ -258,19 +275,200 @@ class LayoutPreservingRenderer:
                 thread_name_prefix="layout-page",
                 initializer=initialize,
             ) as pool:
-                futures = [pool.submit(render, request) for request in requests]
-                for completed, future in enumerate(
-                    as_completed(futures), start=1
+                request_iterator = iter(requests)
+                futures = set()
+                for request in islice(
+                    request_iterator,
+                    worker_count * PAGE_RENDER_QUEUE_MULTIPLIER,
                 ):
+                    futures.add(pool.submit(render, request))
+                completed = 0
+                while futures:
+                    future = next(as_completed(futures))
+                    futures.remove(future)
                     results.append(future.result())
+                    completed += 1
                     if progress:
                         progress(completed, len(requests))
+                    try:
+                        request = next(request_iterator)
+                    except StopIteration:
+                        continue
+                    futures.add(pool.submit(render, request))
         finally:
             for document in documents:
                 document.close()
             cv2.setNumThreads(previous_opencv_threads)
         results.sort(key=lambda item: item.selected_index)
         return results, worker_count, "thread"
+
+    @staticmethod
+    def _write_raster_base_image(
+        fitz_page,
+        rendered_page: Image.Image,
+        temp_dir: Path,
+        selected_index: int,
+    ) -> _RepairImage:
+        """Prefer the original scan before rendering a new full-page bitmap."""
+
+        extracted_base = LayoutPreservingRenderer._write_full_page_source_image(
+            fitz_page,
+            temp_dir,
+            selected_index,
+        )
+        if extracted_base is not None:
+            return extracted_base
+
+        poppler = shutil.which("pdftoppm")
+        source_name = str(getattr(fitz_page.parent, "name", "") or "")
+        if poppler and source_name:
+            output_prefix = temp_dir / (
+                f"raster-base-page-{selected_index:06d}-poppler"
+            )
+            output_path = output_prefix.with_suffix(".png")
+            try:
+                completed = subprocess.run(
+                    [
+                        poppler,
+                        "-png",
+                        "-r",
+                        str(
+                            max(
+                                72,
+                                int(
+                                    round(
+                                        72
+                                        * rendered_page.width
+                                        / max(float(fitz_page.rect.width), 1.0)
+                                    )
+                                ),
+                            )
+                        ),
+                        "-f",
+                        str(fitz_page.number + 1),
+                        "-l",
+                        str(fitz_page.number + 1),
+                        "-singlefile",
+                        source_name,
+                        str(output_prefix),
+                    ],
+                    check=False,
+                    capture_output=True,
+                    timeout=120,
+                )
+                if completed.returncode == 0 and output_path.is_file():
+                    return _RepairImage(
+                        path=str(output_path),
+                        bbox=[
+                            0.0,
+                            0.0,
+                            float(fitz_page.rect.width),
+                            float(fitz_page.rect.height),
+                        ],
+                    )
+            except (OSError, subprocess.SubprocessError):
+                pass
+
+        image_path = temp_dir / (f"raster-base-page-{selected_index:06d}.png")
+        rendered_page.save(
+            image_path,
+            format="PNG",
+            optimize=True,
+            compress_level=9,
+        )
+        return _RepairImage(
+            path=str(image_path),
+            bbox=[
+                0.0,
+                0.0,
+                float(fitz_page.rect.width),
+                float(fitz_page.rect.height),
+            ],
+        )
+
+    @staticmethod
+    def _write_full_page_source_image(
+        fitz_page,
+        temp_dir: Path,
+        selected_index: int,
+    ) -> _RepairImage | None:
+        """Extract a single unrotated page scan without PNG transcoding."""
+
+        try:
+            images = fitz_page.get_images(full=True)
+            if len(images) == 1:
+                xref = images[0][0]
+                extracted = fitz_page.parent.extract_image(xref)
+                placements = fitz_page.get_image_rects(xref, transform=True)
+                if len(placements) == 1:
+                    placement, matrix = placements[0]
+                    image_width = int(extracted.get("width", 0))
+                    image_height = int(extracted.get("height", 0))
+                    page_ratio = float(placement.width) / max(
+                        float(placement.height), 1.0
+                    )
+                    image_ratio = image_width / max(image_height, 1)
+                    covers_page = (
+                        float(placement.width) >= float(fitz_page.rect.width) * 0.94
+                        and float(placement.height)
+                        >= float(fitz_page.rect.height) * 0.94
+                    )
+                    unrotated = (
+                        abs(float(matrix.b)) <= 0.01 and abs(float(matrix.c)) <= 0.01
+                    )
+                    if (
+                        image_width >= 900
+                        and image_height >= 900
+                        and covers_page
+                        and unrotated
+                        and abs(page_ratio - image_ratio) <= 0.035
+                    ):
+                        extension = str(extracted.get("ext", "png")).lower()
+                        if extension not in {"png", "jpg", "jpeg"}:
+                            extension = "png"
+                        image_path = temp_dir / (
+                            f"raster-base-page-{selected_index:06d}.{extension}"
+                        )
+                        image_path.write_bytes(extracted["image"])
+                        return _RepairImage(
+                            path=str(image_path),
+                            bbox=[
+                                float(placement.x0),
+                                float(placement.y0),
+                                float(placement.x1),
+                                float(placement.y1),
+                            ],
+                        )
+        except Exception:
+            pass
+        return None
+
+    @staticmethod
+    def _write_repaired_raster_base_image(
+        page_array: np.ndarray,
+        fitz_page,
+        temp_dir: Path,
+        selected_index: int,
+    ) -> _RepairImage:
+        """Write one aligned, inpainted JPEG base for an image-only page."""
+
+        image_path = temp_dir / (f"raster-repaired-page-{selected_index:06d}.jpg")
+        Image.fromarray(page_array, mode="RGB").save(
+            image_path,
+            format="JPEG",
+            quality=90,
+            optimize=True,
+            subsampling=1,
+        )
+        return _RepairImage(
+            path=str(image_path),
+            bbox=[
+                0.0,
+                0.0,
+                float(fitz_page.rect.width),
+                float(fitz_page.rect.height),
+            ],
+        )
 
     def _prepare_page(
         self,
@@ -291,45 +489,84 @@ class LayoutPreservingRenderer:
             request.segments,
             key=lambda item: item.reading_order,
         )
+        source_blocks = self._page_source_blocks(fitz_page)
         fallback_segments = [
             segment
             for segment in candidate_segments
             if segment.status == "source_fallback"
         ]
-        replaceable_segments = [
+        replaceable_segments: list[Segment] = []
+        layout_fragments: dict[str, list[_LayoutFragment]] = {}
+        for original_segment in candidate_segments:
+            if original_segment.status == "source_fallback":
+                continue
+            fragments = self._layout_fragments_for_segment(
+                original_segment, source_blocks
+            )
+            segment = original_segment
+            if len(fragments) == 1:
+                fragment = fragments[0]
+                segment = replace(
+                    segment,
+                    bbox=list(fragment.bbox),
+                    erase_bboxes=[
+                        list(box) for box in (fragment.line_bboxes or [fragment.bbox])
+                    ],
+                    rotation_degrees=(
+                        fragment.rotation_degrees
+                        if abs(segment.rotation_degrees) < 0.05
+                        else segment.rotation_degrees
+                    ),
+                    source_kind=(
+                        "pdf_text"
+                        if self._is_vector_segment(segment)
+                        else segment.source_kind
+                    ),
+                )
+            replaceable_segments.append(segment)
+            layout_fragments[segment.segment_id] = fragments
+        raster_segments = [
             segment
-            for segment in candidate_segments
-            if segment.status != "source_fallback"
+            for segment in replaceable_segments
+            if not self._is_vector_segment(segment)
         ]
-        dense_detail = self._dense_page_detail(
-            request.page_number,
-            candidate_segments,
-            request.width,
-            request.height,
+        dense_detail = (
+            self._dense_page_detail(
+                request.page_number,
+                raster_segments,
+                request.width,
+                request.height,
+            )
+            if raster_segments
+            else None
         )
         dense_cleanup = (
             self._dense_flat_page_cleanup(
                 page_array,
-                candidate_segments,
+                raster_segments,
                 page_width=request.width,
                 page_height=request.height,
             )
-            if dense_detail and not fallback_segments
+            if (
+                dense_detail
+                and not fallback_segments
+                and len(raster_segments) == len(replaceable_segments)
+            )
             else None
         )
         page_segments = [
             segment
             for segment in replaceable_segments
-            if dense_cleanup is not None
-            or self._contains_translatable_english(segment.source_text)
-        ]
-        source_blocks = self._page_source_blocks(fitz_page)
-        layout_fragments = {
-            segment.segment_id: self._layout_fragments_for_segment(
-                segment, source_blocks
+            if (
+                dense_cleanup is not None
+                or self._contains_translatable_english(segment.source_text)
             )
-            for segment in page_segments
-        }
+            and self._translation_changes_source(segment)
+        ]
+        raster_page_segments = [
+            segment for segment in page_segments if not self._is_vector_segment(segment)
+        ]
+        raster_base_image: _RepairImage | None = None
         repair_boxes = {
             segment.segment_id: (
                 [
@@ -354,7 +591,7 @@ class LayoutPreservingRenderer:
         else:
             inpainted_page, text_mask, mask_ratio = self._inpaint_source_text(
                 page_array,
-                page_segments,
+                raster_page_segments,
                 page_width=request.width,
                 page_height=request.height,
                 scale_x=scale_x,
@@ -362,9 +599,7 @@ class LayoutPreservingRenderer:
                 erase_boxes=repair_boxes,
             )
 
-        repair_patches: list[
-            tuple[tuple[int, int, int, int], np.ndarray]
-        ] = []
+        repair_patches: list[tuple[tuple[int, int, int, int], np.ndarray]] = []
         prepared: list[_PreparedTranslation] = []
         complex_backgrounds = 0
         for segment in page_segments:
@@ -376,25 +611,23 @@ class LayoutPreservingRenderer:
                 segment.placeholders,
                 request.ignore_number_warnings,
             ):
-                raise ValidationBlockedError(
-                    f"{segment.segment_id} 的占位符无法恢复。"
-                )
+                raise ValidationBlockedError(f"{segment.segment_id} 的占位符无法恢复。")
 
-            if dense_cleanup is not None:
+            if self._is_vector_segment(segment):
+                background_mode = "vector-text-removal"
+            elif dense_cleanup is not None:
                 background_mode = "dense-flat-cleanup"
             else:
-                background_mode, pixel_bbox, patch = (
-                    self._build_repaired_patch(
-                        page_array,
-                        inpainted_page,
-                        text_mask,
-                        segment,
-                        repair_boxes[segment.segment_id],
-                        page_width=request.width,
-                        page_height=request.height,
-                        scale_x=scale_x,
-                        scale_y=scale_y,
-                    )
+                background_mode, pixel_bbox, patch = self._build_repaired_patch(
+                    page_array,
+                    inpainted_page,
+                    text_mask,
+                    segment,
+                    repair_boxes[segment.segment_id],
+                    page_width=request.width,
+                    page_height=request.height,
+                    scale_x=scale_x,
+                    scale_y=scale_y,
                 )
                 if patch is not None and pixel_bbox is not None:
                     repair_patches.append((pixel_bbox, patch))
@@ -435,6 +668,26 @@ class LayoutPreservingRenderer:
             if dense_cleanup is None
             else []
         )
+        if raster_page_segments:
+            if dense_cleanup is None:
+                # The text mask and its repaired pixels were calculated in
+                # the same raster coordinate space. Baking them into one base
+                # avoids antialiased source-text halos caused by resampling a
+                # separate transparent repair tile over the source scan.
+                raster_base_image = self._write_repaired_raster_base_image(
+                    inpainted_page,
+                    fitz_page,
+                    temp_dir,
+                    request.selected_index,
+                )
+                repair_images = []
+            else:
+                raster_base_image = self._write_raster_base_image(
+                    fitz_page,
+                    page_image,
+                    temp_dir,
+                    request.selected_index,
+                )
 
         return _PageRenderResult(
             selected_index=request.selected_index,
@@ -448,6 +701,7 @@ class LayoutPreservingRenderer:
             mask_ratio=mask_ratio,
             dense_detail=dense_detail,
             complex_backgrounds=complex_backgrounds,
+            raster_base_image=raster_base_image,
         )
 
     def _generation_fingerprint(
@@ -478,9 +732,7 @@ class LayoutPreservingRenderer:
                 "translated_segments": validation.translated_segments,
                 "blocking_errors": validation.blocking_errors,
                 "warnings": validation.warnings,
-                "issues": [
-                    issue.to_dict() for issue in validation.issues
-                ],
+                "issues": [issue.to_dict() for issue in validation.issues],
                 "can_generate": validation.can_generate,
             },
             "segments": [
@@ -496,6 +748,25 @@ class LayoutPreservingRenderer:
                     "erase_bboxes": segment.erase_bboxes,
                     "font_name": segment.font_name,
                     "font_size": segment.font_size,
+                    "paragraph_id": segment.paragraph_id,
+                    "continuation": segment.continuation,
+                    "rotation_degrees": segment.rotation_degrees,
+                    "source_kind": segment.source_kind,
+                    "anchors": [
+                        {
+                            "anchor_id": anchor.anchor_id,
+                            "page_number": anchor.page_number,
+                            "reading_order": anchor.reading_order,
+                            "bbox": anchor.bbox,
+                            "erase_bboxes": anchor.erase_bboxes,
+                            "source_text": anchor.source_text,
+                            "column_id": anchor.column_id,
+                            "layout_label": anchor.layout_label,
+                            "rotation_degrees": anchor.rotation_degrees,
+                            "source_kind": anchor.source_kind,
+                        }
+                        for anchor in segment.visual_anchors
+                    ],
                     "placeholders": [
                         {
                             "token": item.token,
@@ -525,9 +796,7 @@ class LayoutPreservingRenderer:
         selected_source_pages: list,
     ) -> LayoutRenderOutputs | None:
         if not (
-            output_path.is_file()
-            and quality_json.is_file()
-            and quality_html.is_file()
+            output_path.is_file() and quality_json.is_file() and quality_html.is_file()
         ):
             return None
         try:
@@ -558,6 +827,95 @@ class LayoutPreservingRenderer:
         task_dir: Path,
         progress: ProgressCallback | None = None,
     ) -> LayoutRenderOutputs:
+        run_id = uuid.uuid4().hex
+        temp_dir = task_dir / "tmp" / f"layout-replacement-{run_id}"
+        legacy_temp_dir = task_dir / "tmp" / "layout-replacement"
+        try:
+            return self._generate_impl(
+                task,
+                validation,
+                task_dir,
+                run_id=run_id,
+                progress=progress,
+            )
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            shutil.rmtree(legacy_temp_dir, ignore_errors=True)
+
+    def _create_vector_clean_source(
+        self,
+        source_path: Path,
+        page_results: list[_PageRenderResult],
+        temp_dir: Path,
+    ) -> tuple[Path, int, set[int]]:
+        """Remove only source text objects while preserving images and paths."""
+
+        import fitz
+
+        boxes_by_page: dict[int, list[list[float]]] = {}
+        for page_result in page_results:
+            boxes: list[list[float]] = []
+            for item in page_result.prepared:
+                if not self._is_vector_segment(item.segment):
+                    continue
+                fragment_boxes = [
+                    box
+                    for fragment in item.fragments
+                    for box in (fragment.line_bboxes or [fragment.bbox])
+                ]
+                boxes.extend(
+                    fragment_boxes or item.segment.erase_bboxes or [item.segment.bbox]
+                )
+            if boxes:
+                boxes_by_page[page_result.page_number] = boxes
+        if not boxes_by_page:
+            return source_path, 0, set()
+
+        clean_path = temp_dir / "vector-clean-source.pdf"
+        document = fitz.open(source_path)
+        redaction_count = 0
+        try:
+            for page_number, supplied_boxes in boxes_by_page.items():
+                page = document.load_page(page_number - 1)
+                unique_boxes = {
+                    tuple(round(float(value), 3) for value in box)
+                    for box in supplied_boxes
+                    if len(box) == 4
+                }
+                page_redactions = 0
+                for box in sorted(unique_boxes):
+                    rect = fitz.Rect(box) & page.rect
+                    if rect.is_empty or rect.is_infinite:
+                        continue
+                    page.add_redact_annot(
+                        rect,
+                        fill=None,
+                        cross_out=False,
+                    )
+                    page_redactions += 1
+                if page_redactions:
+                    # Text=0 removes overlapping text glyphs. Images=0 and
+                    # graphics=0 explicitly leave photographs, fills, vector
+                    # artwork, and rules untouched.
+                    page.apply_redactions(images=0, graphics=0, text=0)
+                    redaction_count += page_redactions
+            document.save(
+                clean_path,
+                garbage=4,
+                deflate=True,
+            )
+        finally:
+            document.close()
+        return clean_path, redaction_count, set(boxes_by_page)
+
+    def _generate_impl(
+        self,
+        task: TranslationTask,
+        validation: ValidationReport,
+        task_dir: Path,
+        run_id: str,
+        progress: ProgressCallback | None = None,
+    ) -> LayoutRenderOutputs:
         if not validation.can_generate:
             raise ValidationBlockedError(
                 f"存在 {validation.blocking_errors} 个阻断性错误，不能生成原版面中文版。"
@@ -570,12 +928,14 @@ class LayoutPreservingRenderer:
         try:
             import fitz
         except ImportError as exc:
-            raise ValidationBlockedError("缺少 PyMuPDF，无法生成原版面中文版。") from exc
+            raise ValidationBlockedError(
+                "缺少 PyMuPDF，无法生成原版面中文版。"
+            ) from exc
 
         font_name, font_path = self.font_resolver.register()
         output_dir = task_dir / "outputs"
         report_dir = task_dir / "reports"
-        temp_dir = task_dir / "tmp" / "layout-replacement"
+        temp_dir = task_dir / "tmp" / f"layout-replacement-{run_id}"
         output_dir.mkdir(parents=True, exist_ok=True)
         report_dir.mkdir(parents=True, exist_ok=True)
         stem = safe_stem(task.source_filename)
@@ -616,11 +976,13 @@ class LayoutPreservingRenderer:
                 progress(task.page_count, task.page_count)
             return cached
 
-        if temp_dir.exists():
-            shutil.rmtree(temp_dir)
         temp_dir.mkdir(parents=True)
         segments_by_page: dict[int, list[Segment]] = {}
-        for segment in task.translatable_segments:
+        render_segments = self._expand_visual_segments(
+            task.translatable_segments,
+            task.settings.ignore_number_warnings,
+        )
+        for segment in render_segments:
             segments_by_page.setdefault(segment.page_number, []).append(segment)
 
         requests = []
@@ -633,9 +995,7 @@ class LayoutPreservingRenderer:
                     width=float(source_page.mediabox.width),
                     height=float(source_page.mediabox.height),
                     segments=segments_by_page.get(page_number, []),
-                    ignore_number_warnings=(
-                        task.settings.ignore_number_warnings
-                    ),
+                    ignore_number_warnings=(task.settings.ignore_number_warnings),
                 )
             )
 
@@ -645,20 +1005,45 @@ class LayoutPreservingRenderer:
             temp_dir,
             progress,
         )
+        (
+            assembly_source_path,
+            vector_text_redactions,
+            vector_cleaned_pages,
+        ) = self._create_vector_clean_source(
+            source_path,
+            page_results,
+            temp_dir,
+        )
+        assembly_source_reader = PdfReader(str(assembly_source_path), strict=False)
+        assembly_source_pages = [
+            (
+                assembly_source_reader.pages[page_number - 1]
+                if page_number in vector_cleaned_pages
+                else source_reader.pages[page_number - 1]
+            )
+            for page_number in page_numbers
+        ]
         overlay = canvas.Canvas(str(overlay_path), pageCompression=1)
         placements: list[_Placement] = []
         page_mask_ratios = [item.mask_ratio for item in page_results]
         dense_page_details = [
-            item.dense_detail
-            for item in page_results
-            if item.dense_detail is not None
+            item.dense_detail for item in page_results if item.dense_detail is not None
         ]
-        complex_backgrounds = sum(
-            item.complex_backgrounds for item in page_results
-        )
+        complex_backgrounds = sum(item.complex_backgrounds for item in page_results)
         try:
             for page_result in page_results:
                 overlay.setPageSize((page_result.width, page_result.height))
+                if page_result.raster_base_image is not None:
+                    raster_base = page_result.raster_base_image
+                    x0, y0, x1, y1 = raster_base.bbox
+                    overlay.drawImage(
+                        raster_base.path,
+                        x0,
+                        page_result.height - y1,
+                        x1 - x0,
+                        y1 - y0,
+                        mask=None,
+                    )
                 if page_result.dense_cleanup is not None:
                     cleanup_box, cleanup_color = page_result.dense_cleanup
                     self._draw_dense_flat_cleanup(
@@ -710,9 +1095,31 @@ class LayoutPreservingRenderer:
         temporary_output = output_path.with_suffix(".pdf.tmp")
         overlay_reader = PdfReader(str(overlay_path), strict=False)
         writer = PdfWriter()
-        for overlay_index, source_page in enumerate(selected_source_pages):
-            writer.add_page(source_page)
+        rasterized_pages = {
+            item.page_number
+            for item in page_results
+            if item.raster_base_image is not None
+        }
+        for overlay_index, (page_number, source_page) in enumerate(
+            zip(page_numbers, assembly_source_pages, strict=True)
+        ):
+            page_result = page_results[overlay_index]
+            if page_number in rasterized_pages:
+                writer.add_blank_page(
+                    width=float(source_page.mediabox.width),
+                    height=float(source_page.mediabox.height),
+                )
+            else:
+                writer.add_page(source_page)
             output_page = writer.pages[-1]
+            has_overlay_content = bool(
+                page_result.raster_base_image
+                or page_result.repair_images
+                or page_result.dense_cleanup
+                or page_result.prepared
+            )
+            if not has_overlay_content:
+                continue
             output_page.merge_page(overlay_reader.pages[overlay_index])
             merged_content = output_page.get_contents()
             if merged_content is not None:
@@ -720,9 +1127,7 @@ class LayoutPreservingRenderer:
                 # /Contents array untouched after merge_page(). Replacing it
                 # explicitly guarantees that the combined source and overlay
                 # operators are stored as one Flate-compressed stream.
-                output_page.replace_contents(
-                    merged_content.flate_encode(level=9)
-                )
+                output_page.replace_contents(merged_content.flate_encode(level=9))
         writer.add_metadata(
             {
                 "/Title": f"{task.source_filename} - 原版面中文版",
@@ -730,6 +1135,7 @@ class LayoutPreservingRenderer:
                 "/Subject": f"Task {task.task_id}",
             }
         )
+        writer.compress_identical_objects()
         with temporary_output.open("wb") as stream:
             writer.write(stream)
             stream.flush()
@@ -748,19 +1154,22 @@ class LayoutPreservingRenderer:
             "render_dpi": self.render_dpi,
             "render_workers": render_workers,
             "render_backend": render_backend,
-            "content_stream_compression": "flate-level-9",
+            "content_stream_compression": "flate-level-9-and-object-deduplication",
             "repair_image_encoding": "binary-flate-rgba-tiles",
             "repair_image_layers": sum(
                 bool(item.repair_images) for item in page_results
             ),
-            "repair_image_tiles": sum(
-                len(item.repair_images) for item in page_results
-            ),
+            "repair_image_tiles": sum(len(item.repair_images) for item in page_results),
+            "vector_text_redactions": vector_text_redactions,
+            "vector_cleaned_pages": len(vector_cleaned_pages),
+            "rasterized_source_pages": sorted(rasterized_pages),
             "source_pages": task.page_count,
             "source_page_numbers": page_numbers,
             "output_pages": verified["page_count"],
             "page_sizes_preserved": verified["page_sizes_preserved"],
             "replaced_segments": len(placements),
+            "semantic_paragraphs": len(task.translatable_segments),
+            "visual_anchors": len(render_segments),
             "source_fallback_segments": len(task.source_fallback_segments),
             "source_fallback_segment_ids": [
                 segment.segment_id for segment in task.source_fallback_segments
@@ -770,14 +1179,10 @@ class LayoutPreservingRenderer:
             "source_bbox_overlap_warnings": len(overlap_pairs),
             "source_bbox_overlap_pairs": overlap_pairs[:100],
             "complex_background_repairs": complex_backgrounds,
-            "masked_page_area_ratio": round(
-                float(np.mean(page_mask_ratios)), 6
-            )
+            "masked_page_area_ratio": round(float(np.mean(page_mask_ratios)), 6)
             if page_mask_ratios
             else 0.0,
-            "maximum_page_mask_area_ratio": round(
-                max(page_mask_ratios), 6
-            )
+            "maximum_page_mask_area_ratio": round(max(page_mask_ratios), 6)
             if page_mask_ratios
             else 0.0,
             "minimum_rendered_font_size": min(
@@ -787,9 +1192,7 @@ class LayoutPreservingRenderer:
                 item.font_size + 0.1 < item.source_font_size for item in placements
             ),
             "rotated_segments": sum(item.rotated for item in placements),
-            "contour_flow_segments": sum(
-                item.contour_flow for item in placements
-            ),
+            "contour_flow_segments": sum(item.contour_flow for item in placements),
             "dense_pages_requiring_review": [
                 item["page"] for item in dense_page_details
             ],
@@ -797,12 +1200,11 @@ class LayoutPreservingRenderer:
             "dense_flat_page_cleanups": [
                 item["page"]
                 for item in dense_page_details
-                if item["page"] in {
+                if item["page"]
+                in {
                     placement.page_number
                     for placement in placements
-                    if placement.background_mode.startswith(
-                        "dense-flat-cleanup"
-                    )
+                    if placement.background_mode.startswith("dense-flat-cleanup")
                 }
             ],
             "font": str(font_path),
@@ -830,7 +1232,6 @@ class LayoutPreservingRenderer:
         }
         atomic_write_json(quality_json, payload)
         self._write_html_report(quality_html, payload)
-        shutil.rmtree(temp_dir)
         return LayoutRenderOutputs(
             layout_pdf=output_path,
             quality_json=quality_json,
@@ -839,6 +1240,163 @@ class LayoutPreservingRenderer:
             overflow_errors=len(overflow),
             cache_hit=False,
             render_workers=render_workers,
+        )
+
+    def _expand_visual_segments(
+        self,
+        segments: list[Segment],
+        ignore_number_warnings: bool,
+    ) -> list[Segment]:
+        """Project semantic paragraphs back into their ordered visual anchors."""
+
+        expanded: list[Segment] = []
+        for segment in segments:
+            anchors = segment.visual_anchors
+            if len(anchors) == 1:
+                expanded.append(segment)
+                continue
+            source_label_indexes: set[int] = set()
+            if segment.status == "source_fallback":
+                chunks = [
+                    anchor.source_text or segment.source_text for anchor in anchors
+                ]
+            else:
+                restored = self.placeholders.restore(
+                    segment.translated_text,
+                    segment.placeholders,
+                )
+                if not self.placeholders.output_restore_ok(
+                    restored,
+                    segment.placeholders,
+                    ignore_number_warnings,
+                ):
+                    raise ValidationBlockedError(
+                        f"{segment.segment_id} 的占位符无法恢复。"
+                    )
+                if segment.continuation in {"cross_column", "cross_page"}:
+                    source_label_indexes = {
+                        index
+                        for index, anchor in enumerate(anchors)
+                        if self._is_short_visual_label(anchor.source_text)
+                    }
+                content_indexes = [
+                    index
+                    for index in range(len(anchors))
+                    if index not in source_label_indexes
+                ]
+                if not content_indexes:
+                    source_label_indexes.clear()
+                    content_indexes = list(range(len(anchors)))
+                content_chunks = self._split_text_across_anchors(
+                    restored.restored_text,
+                    [anchors[index].source_text for index in content_indexes],
+                )
+                translated_by_index = dict(
+                    zip(content_indexes, content_chunks, strict=True)
+                )
+                chunks = [
+                    (
+                        anchor.source_text
+                        if index in source_label_indexes
+                        else translated_by_index[index]
+                    )
+                    for index, anchor in enumerate(anchors)
+                ]
+            for index, (anchor, chunk) in enumerate(
+                zip(anchors, chunks, strict=True),
+                start=1,
+            ):
+                preserve_source_label = index - 1 in source_label_indexes
+                expanded.append(
+                    replace(
+                        segment,
+                        segment_id=f"{segment.segment_id}@A{index:03d}",
+                        page_number=anchor.page_number,
+                        reading_order=anchor.reading_order,
+                        block_type=anchor.layout_label or segment.block_type,
+                        source_text=anchor.source_text or segment.source_text,
+                        protected_text=anchor.source_text or segment.protected_text,
+                        translated_text=chunk,
+                        status=(
+                            "source_fallback"
+                            if preserve_source_label
+                            else segment.status
+                        ),
+                        fallback_reason=(
+                            "独立短标签未与正文译文混排"
+                            if preserve_source_label
+                            else segment.fallback_reason
+                        ),
+                        bbox=list(anchor.bbox),
+                        erase_bboxes=[
+                            list(box) for box in (anchor.erase_bboxes or [anchor.bbox])
+                        ],
+                        placeholders=[],
+                        anchors=[anchor],
+                        layout_label=anchor.layout_label,
+                        column_id=anchor.column_id,
+                        rotation_degrees=anchor.rotation_degrees,
+                        source_kind=anchor.source_kind,
+                    )
+                )
+        return expanded
+
+    @staticmethod
+    def _is_short_visual_label(text: str) -> bool:
+        normalized = normalize_whitespace(text)
+        return bool(
+            len(normalized) <= 30
+            and len(normalized.split()) <= 5
+            and re.fullmatch(r"[A-Z][A-Z0-9 /&+.-]*", normalized)
+        )
+
+    @staticmethod
+    def _split_text_across_anchors(
+        text: str,
+        source_parts: list[str],
+    ) -> list[str]:
+        if len(source_parts) <= 1:
+            return [text]
+        content = text.strip()
+        if not content:
+            return [""] * len(source_parts)
+
+        weights = [max(1, len(re.sub(r"\s+", "", source))) for source in source_parts]
+        total_weight = sum(weights)
+        boundaries = {
+            match.end() for match in re.finditer(r"[\s,，。！？!?；;：:、]", content)
+        }
+        chunks: list[str] = []
+        cursor = 0
+        consumed_weight = 0
+        for weight in weights[:-1]:
+            consumed_weight += weight
+            target = round(len(content) * consumed_weight / total_weight)
+            target = max(cursor + 1, min(target, len(content) - 1))
+            search_radius = max(2, min(24, len(content) // 12))
+            candidates = [
+                boundary
+                for boundary in boundaries
+                if cursor < boundary < len(content)
+                and abs(boundary - target) <= search_radius
+            ]
+            boundary = (
+                min(candidates, key=lambda value: abs(value - target))
+                if candidates
+                else target
+            )
+            chunks.append(content[cursor:boundary].strip())
+            cursor = boundary
+        chunks.append(content[cursor:].strip())
+        return chunks
+
+    def _translation_changes_source(self, segment: Segment) -> bool:
+        restored = self.placeholders.restore(
+            segment.translated_text,
+            segment.placeholders,
+        )
+        return normalize_whitespace(restored.restored_text) != normalize_whitespace(
+            segment.source_text
         )
 
     def _inpaint_source_text(
@@ -852,27 +1410,25 @@ class LayoutPreservingRenderer:
         erase_boxes: dict[str, list[list[float]]] | None = None,
     ) -> tuple[np.ndarray, np.ndarray, float]:
         mask = np.zeros(page_array.shape[:2], dtype=np.uint8)
+        flat_mask = np.zeros(page_array.shape[:2], dtype=np.uint8)
+        flat_repaired = page_array.copy()
+        kernel_size = max(5, int(round(self.render_dpi / 38)))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
+        )
         for segment in segments:
             supplied_boxes = (
-                erase_boxes.get(segment.segment_id)
-                if erase_boxes is not None
-                else None
+                erase_boxes.get(segment.segment_id) if erase_boxes is not None else None
             )
             for supplied in supplied_boxes or segment.erase_bboxes or [segment.bbox]:
-                x0, y0, x1, y1 = self._clamp_bbox(
-                    supplied, page_width, page_height
-                )
-                x_padding, y_padding = self._erase_padding(
-                    segment, y1 - y0
-                )
+                x0, y0, x1, y1 = self._clamp_bbox(supplied, page_width, page_height)
+                x_padding, y_padding = self._erase_padding(segment, y1 - y0)
                 core_x0 = max(0, int(math.floor(x0 * scale_x)))
                 core_y0 = max(0, int(math.floor(y0 * scale_y)))
-                core_x1 = min(
-                    page_array.shape[1], int(math.ceil(x1 * scale_x))
-                )
-                core_y1 = min(
-                    page_array.shape[0], int(math.ceil(y1 * scale_y))
-                )
+                core_x1 = min(page_array.shape[1], int(math.ceil(x1 * scale_x)))
+                core_y1 = min(page_array.shape[0], int(math.ceil(y1 * scale_y)))
                 x0 = max(0, x0 - x_padding)
                 y0 = max(0, y0 - y_padding)
                 x1 = min(page_width, x1 + x_padding)
@@ -885,8 +1441,21 @@ class LayoutPreservingRenderer:
                     continue
 
                 border = self._border_pixels(page_array, px0, py0, px1, py1)
-                background, _ = self._robust_background(border)
+                border_background, border_spread = self._robust_background(border)
                 crop = page_array[py0:py1, px0:px1]
+                dominant_background, dominant_ratio = self._dominant_background(crop)
+                background, ink_threshold = self._select_ocr_background(
+                    border_background,
+                    border_spread,
+                    dominant_background,
+                    dominant_ratio,
+                )
+                flat_background = self._is_flat_ocr_background(
+                    border_background,
+                    border_spread,
+                    dominant_background,
+                    dominant_ratio,
+                )
                 luminance = (
                     crop[:, :, 0].astype(np.float32) * 0.2126
                     + crop[:, :, 1].astype(np.float32) * 0.7152
@@ -897,51 +1466,85 @@ class LayoutPreservingRenderer:
                     + background[1] * 0.7152
                     + background[2] * 0.0722
                 )
-                polarity = self._ink_polarity(
-                    crop, background_luminance
+                polarity = self._ink_polarity(crop, background_luminance)
+                dark_mask = luminance < background_luminance - ink_threshold
+                light_mask = luminance > background_luminance + ink_threshold
+                local_mask = dark_mask if polarity == "dark" else light_mask
+                alternate_mask = light_mask if polarity == "dark" else dark_mask
+                local_core_x0 = max(0, core_x0 - px0)
+                local_core_y0 = max(0, core_y0 - py0)
+                local_core_x1 = min(px1 - px0, core_x1 - px0)
+                local_core_y1 = min(py1 - py0, core_y1 - py0)
+                growth_margin = self._ocr_growth_margin_pixels(
+                    segment.font_size,
+                    scale_x,
+                    scale_y,
+                    self.render_dpi,
                 )
-                if polarity == "dark":
-                    local_mask = luminance < background_luminance - 14
-                else:
-                    local_mask = luminance > background_luminance + 14
+                growth_gate = np.zeros_like(local_mask, dtype=bool)
+                growth_gate[
+                    max(0, local_core_y0 - growth_margin) : min(
+                        py1 - py0, local_core_y1 + growth_margin
+                    ),
+                    max(0, local_core_x0 - growth_margin) : min(
+                        px1 - px0, local_core_x1 + growth_margin
+                    ),
+                ] = True
+                if not np.any(local_mask) and np.any(alternate_mask):
+                    local_mask = alternate_mask
                 if not np.any(local_mask):
-                    local_mask[:, :] = True
-                else:
-                    # Vision frequently clips the ascenders/descenders of large
-                    # serif titles. Keep dark connected components that touch the
-                    # original OCR box, allowing the mask to grow into the padded
-                    # area without also deleting a nearby rule or image edge.
-                    component_count, labels = cv2.connectedComponents(
-                        local_mask.astype(np.uint8), connectivity=8
-                    )
-                    local_core_x0 = max(0, core_x0 - px0)
-                    local_core_y0 = max(0, core_y0 - py0)
-                    local_core_x1 = min(px1 - px0, core_x1 - px0)
-                    local_core_y1 = min(py1 - py0, core_y1 - py0)
-                    core_labels = np.unique(
-                        labels[
-                            local_core_y0:local_core_y1,
-                            local_core_x0:local_core_x1,
-                        ]
-                    )
-                    core_labels = core_labels[core_labels != 0]
-                    if component_count > 1 and core_labels.size:
-                        local_mask = np.isin(labels, core_labels)
-                mask[py0:py1, px0:px1] = np.maximum(
-                    mask[py0:py1, px0:px1],
-                    local_mask.astype(np.uint8) * 255,
+                    continue
+                # Vision frequently clips the ascenders/descenders of large
+                # serif titles. Keep connected components that touch the
+                # original OCR box, but cap growth just outside that box.
+                # Without this cap, white cover text connected to a large
+                # white illustration can erase the illustration or page
+                # background along with the glyphs.
+                component_count, labels = cv2.connectedComponents(
+                    local_mask.astype(np.uint8), connectivity=8
                 )
+                core_labels = np.unique(
+                    labels[
+                        local_core_y0:local_core_y1,
+                        local_core_x0:local_core_x1,
+                    ]
+                )
+                core_labels = core_labels[core_labels != 0]
+                if component_count > 1 and core_labels.size:
+                    local_mask = np.isin(labels, core_labels)
+                local_mask &= growth_gate
+                local_mask_pixels = local_mask.astype(np.uint8) * 255
+                if flat_background:
+                    # On genuinely flat artwork, content-aware inpainting can
+                    # average bright and dark glyph edges into visible grey
+                    # clouds. Replace only the detected glyph pixels with the
+                    # statistically dominant background color instead.
+                    local_mask_pixels = cv2.dilate(
+                        local_mask_pixels,
+                        kernel,
+                        iterations=1,
+                    )
+                    local_flat_mask = flat_mask[py0:py1, px0:px1]
+                    flat_mask[py0:py1, px0:px1] = np.maximum(
+                        local_flat_mask,
+                        local_mask_pixels,
+                    )
+                    local_repaired = flat_repaired[py0:py1, px0:px1]
+                    local_repaired[local_mask_pixels > 0] = np.clip(
+                        background,
+                        0,
+                        255,
+                    ).astype(np.uint8)
+                else:
+                    mask[py0:py1, px0:px1] = np.maximum(
+                        mask[py0:py1, px0:px1],
+                        local_mask_pixels,
+                    )
 
         # High-resolution scans often contain thin italic serifs that extend a
         # pixel beyond Vision's line geometry.  A slightly wider high-DPI mask
         # removes those residual strokes without replacing the whole text box
         # or flattening the photograph underneath it.
-        kernel_size = max(5, int(round(self.render_dpi / 38)))
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-        kernel = cv2.getStructuringElement(
-            cv2.MORPH_ELLIPSE, (kernel_size, kernel_size)
-        )
         mask = cv2.dilate(mask, kernel, iterations=1)
         inpaint_radius = max(2.0, self.render_dpi / 70.0)
         repaired = cv2.inpaint(
@@ -950,7 +1553,85 @@ class LayoutPreservingRenderer:
             inpaint_radius,
             cv2.INPAINT_TELEA,
         )
-        return repaired, mask, float(np.mean(mask > 0))
+        repaired[flat_mask > 0] = flat_repaired[flat_mask > 0]
+        combined_mask = np.maximum(mask, flat_mask)
+        return repaired, combined_mask, float(np.mean(combined_mask > 0))
+
+    @staticmethod
+    def _ocr_growth_margin_pixels(
+        font_size: float,
+        scale_x: float,
+        scale_y: float,
+        render_dpi: int,
+    ) -> int:
+        """Allow Vision-clipped display glyphs to reach their real edges."""
+
+        base_margin = max(1.0, render_dpi / 120.0)
+        font_margin_points = min(8.0, max(0.75, float(font_size) * 0.08))
+        geometry_margin = font_margin_points * max(
+            1.0,
+            (float(scale_x) + float(scale_y)) * 0.5,
+        )
+        return max(1, int(round(max(base_margin, geometry_margin))))
+
+    @staticmethod
+    def _select_ocr_background(
+        border_background: np.ndarray,
+        border_spread: float,
+        dominant_background: np.ndarray,
+        dominant_ratio: float,
+    ) -> tuple[np.ndarray, float]:
+        """Choose a scan background without mistaking a large glyph for it."""
+
+        color_distance = LayoutPreservingRenderer._background_color_distance(
+            border_background,
+            dominant_background,
+        )
+        dominant_matches_border = color_distance <= 32.0
+        flat_region = LayoutPreservingRenderer._is_flat_ocr_background(
+            border_background,
+            border_spread,
+            dominant_background,
+            dominant_ratio,
+        )
+        background = (
+            dominant_background
+            if flat_region or (dominant_ratio >= 0.18 and dominant_matches_border)
+            else border_background
+        )
+        return background, 6.0 if flat_region else 14.0
+
+    @staticmethod
+    def _background_color_distance(
+        border_background: np.ndarray,
+        dominant_background: np.ndarray,
+    ) -> float:
+        return float(
+            np.max(
+                np.abs(
+                    dominant_background.astype(np.float32)
+                    - border_background.astype(np.float32)
+                )
+            )
+        )
+
+    @staticmethod
+    def _is_flat_ocr_background(
+        border_background: np.ndarray,
+        border_spread: float,
+        dominant_background: np.ndarray,
+        dominant_ratio: float,
+    ) -> bool:
+        color_distance = LayoutPreservingRenderer._background_color_distance(
+            border_background,
+            dominant_background,
+        )
+        # A crop-level mode above 40% is strong evidence of deliberate flat
+        # artwork even when a nearby icon contaminates the sampled border.
+        # The stricter border rule still handles almost-uniform paper scans.
+        return dominant_ratio >= 0.40 or (
+            border_spread <= 3.0 and dominant_ratio >= 0.30 and color_distance <= 16.0
+        )
 
     def _build_repaired_patch(
         self,
@@ -968,9 +1649,7 @@ class LayoutPreservingRenderer:
         all_y0 = min(float(box[1]) for box in line_bboxes)
         all_x1 = max(float(box[2]) for box in line_bboxes)
         all_y1 = max(float(box[3]) for box in line_bboxes)
-        x_padding, y_padding = self._erase_padding(
-            segment, all_y1 - all_y0
-        )
+        x_padding, y_padding = self._erase_padding(segment, all_y1 - all_y0)
         x0, y0, x1, y1 = self._clamp_bbox(
             [
                 all_x0 - x_padding,
@@ -995,9 +1674,7 @@ class LayoutPreservingRenderer:
         alpha = text_mask[py0:py1, px0:px1]
         if not np.any(alpha):
             return "inpaint-empty", None, None
-        dominant_background, dominant_ratio = self._dominant_background(
-            original_patch
-        )
+        dominant_background, dominant_ratio = self._dominant_background(original_patch)
         if dominant_ratio >= 0.32:
             patch = original_patch.copy()
             patch[alpha > 0] = dominant_background
@@ -1028,9 +1705,7 @@ class LayoutPreservingRenderer:
             maximum_groups=MAX_REPAIR_TILES_PER_PAGE,
         )
         repair_images: list[_RepairImage] = []
-        for tile_index, (tile_bbox, tile_patches) in enumerate(
-            groups, start=1
-        ):
+        for tile_index, (tile_bbox, tile_patches) in enumerate(groups, start=1):
             left, top, right, bottom = tile_bbox
             tile = Image.new(
                 "RGBA",
@@ -1055,8 +1730,7 @@ class LayoutPreservingRenderer:
                 top + crop_bottom,
             )
             repair_path = temp_dir / (
-                f"repair-page-{selected_index:06d}"
-                f"-tile-{tile_index:03d}.png"
+                f"repair-page-{selected_index:06d}-tile-{tile_index:03d}.png"
             )
             tile.save(
                 repair_path,
@@ -1099,9 +1773,7 @@ class LayoutPreservingRenderer:
                 match_indexes = [
                     index
                     for index, (candidate_bbox, _) in enumerate(groups)
-                    if cls._repair_boxes_are_close(
-                        bbox, candidate_bbox, gap
-                    )
+                    if cls._repair_boxes_are_close(bbox, candidate_bbox, gap)
                 ]
                 if match_indexes:
                     for index in reversed(match_indexes):
@@ -1176,7 +1848,14 @@ class LayoutPreservingRenderer:
     def _erase_padding(segment: Segment, height: float) -> tuple[float, float]:
         x_padding = max(0.9, min(3.0, height * 0.20))
         if segment.block_type == "title":
-            return x_padding, max(3.0, min(14.0, height * 0.58))
+            display_x_padding = min(
+                10.0,
+                max(height * 0.08, float(segment.font_size or 0.0) * 0.10),
+            )
+            return (
+                max(x_padding, display_x_padding),
+                max(3.0, min(14.0, height * 0.58)),
+            )
         if segment.block_type == "heading":
             return x_padding, max(1.5, min(5.0, height * 0.34))
         return x_padding, max(0.9, min(3.0, height * 0.20))
@@ -1185,9 +1864,7 @@ class LayoutPreservingRenderer:
     def _page_source_blocks(fitz_page) -> list[dict[str, object]]:
         import fitz
 
-        page_dict = fitz_page.get_text(
-            "dict", flags=fitz.TEXTFLAGS_TEXT, sort=True
-        )
+        page_dict = fitz_page.get_text("dict", flags=fitz.TEXTFLAGS_TEXT, sort=True)
         blocks: list[dict[str, object]] = []
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -1197,9 +1874,7 @@ class LayoutPreservingRenderer:
             for item in PDFParser.text_block_fragments(block):
                 spans = list(item["spans"])
                 sizes = [
-                    float(span.get("size", 0.0))
-                    for span in spans
-                    if span.get("size")
+                    float(span.get("size", 0.0)) for span in spans if span.get("size")
                 ]
                 fragments.append(
                     _LayoutFragment(
@@ -1210,15 +1885,13 @@ class LayoutPreservingRenderer:
                             [float(value) for value in box]
                             for box in item["line_bboxes"]
                         ],
+                        rotation_degrees=float(item.get("rotation_degrees", 0.0)),
                     )
                 )
             blocks.append(
                 {
                     "text": normalize_whitespace(block_text),
-                    "bbox": [
-                        float(value)
-                        for value in block.get("bbox", (0, 0, 0, 0))
-                    ],
+                    "bbox": [float(value) for value in block.get("bbox", (0, 0, 0, 0))],
                     "fragments": fragments,
                 }
             )
@@ -1274,8 +1947,7 @@ class LayoutPreservingRenderer:
     @staticmethod
     def _bbox_distance(first: list[float], second: list[float]) -> float:
         return sum(
-            abs(float(left) - float(right))
-            for left, right in zip(first, second)
+            abs(float(left) - float(right)) for left, right in zip(first, second)
         )
 
     def _draw_fragmented_translation(
@@ -1291,20 +1963,18 @@ class LayoutPreservingRenderer:
     ) -> _Placement:
         chunks = self._partition_translation(text, fragments)
         if len(chunks) != len(fragments):
-            return self._draw_translation(
-                pdf_canvas,
-                segment,
+            chunks = self._split_text_across_anchors(
                 text,
-                page_height,
-                font_name,
-                text_color,
-                background_mode,
+                [fragment.source_text for fragment in fragments],
             )
 
         fragment_placements: list[_Placement] = []
         for index, (fragment, chunk) in enumerate(zip(fragments, chunks)):
             draw_bbox = list(fragment.bbox)
-            if index + 1 < len(fragments):
+            fragment_is_rotated = abs(fragment.rotation_degrees) >= 3.0
+            if fragment_is_rotated:
+                pass
+            elif index + 1 < len(fragments):
                 draw_bbox[2] = max(
                     draw_bbox[2],
                     fragments[index + 1].bbox[0] - 1.5,
@@ -1338,6 +2008,8 @@ class LayoutPreservingRenderer:
                     )
                 ],
                 font_size=fragment.font_size or segment.font_size,
+                rotation_degrees=fragment.rotation_degrees,
+                source_kind="pdf_text",
             )
             fragment_placements.append(
                 self._draw_translation(
@@ -1354,16 +2026,12 @@ class LayoutPreservingRenderer:
             segment_id=segment.segment_id,
             page_number=segment.page_number,
             bbox=list(segment.bbox),
-            font_size=round(
-                min(item.font_size for item in fragment_placements), 2
-            ),
+            font_size=round(min(item.font_size for item in fragment_placements), 2),
             source_font_size=round(
                 min(item.source_font_size for item in fragment_placements), 2
             ),
             rotated=any(item.rotated for item in fragment_placements),
-            contour_flow=any(
-                item.contour_flow for item in fragment_placements
-            ),
+            contour_flow=any(item.contour_flow for item in fragment_placements),
             fitted=all(item.fitted for item in fragment_placements),
             background_mode=background_mode + "-fragmented",
         )
@@ -1404,9 +2072,7 @@ class LayoutPreservingRenderer:
 
         def chunk_cost(fragment_index: int, start: int, end: int) -> float:
             chunk = " ".join(tokens[start:end]).casefold()
-            target_ratio = (
-                token_prefix[end] - token_prefix[start]
-            ) / target_total
+            target_ratio = (token_prefix[end] - token_prefix[start]) / target_total
             source_ratio = source_lengths[fragment_index] / source_total
             cost = abs(target_ratio - source_ratio) * 12.0
             for anchor, owner in unique_anchors.items():
@@ -1427,27 +2093,18 @@ class LayoutPreservingRenderer:
             return cost
 
         infinity = float("inf")
-        costs = [
-            [infinity] * (len(tokens) + 1)
-            for _ in range(fragment_count + 1)
-        ]
-        previous = [
-            [-1] * (len(tokens) + 1)
-            for _ in range(fragment_count + 1)
-        ]
+        costs = [[infinity] * (len(tokens) + 1) for _ in range(fragment_count + 1)]
+        previous = [[-1] * (len(tokens) + 1) for _ in range(fragment_count + 1)]
         costs[0][0] = 0.0
         for fragment_index in range(fragment_count):
             minimum_end = fragment_index + 1
-            maximum_end = len(tokens) - (
-                fragment_count - fragment_index - 1
-            )
+            maximum_end = len(tokens) - (fragment_count - fragment_index - 1)
             for start in range(fragment_index, len(tokens)):
                 if not math.isfinite(costs[fragment_index][start]):
                     continue
                 for end in range(max(start + 1, minimum_end), maximum_end + 1):
-                    candidate = (
-                        costs[fragment_index][start]
-                        + chunk_cost(fragment_index, start, end)
+                    candidate = costs[fragment_index][start] + chunk_cost(
+                        fragment_index, start, end
                     )
                     if candidate < costs[fragment_index + 1][end]:
                         costs[fragment_index + 1][end] = candidate
@@ -1532,11 +2189,15 @@ class LayoutPreservingRenderer:
             if is_dense_cleanup and not is_index_marker
             else segment.block_type
         )
-        rotated = self._is_rotated_segment(segment, text)
+        rotation_degrees = self._segment_rotation(segment, text)
+        rotated = abs(rotation_degrees) >= 3.0
         contour_flow = (
             not rotated
-            and effective_block_type not in {"title", "heading"}
             and len(segment.erase_bboxes) > 1
+            and (
+                effective_block_type not in {"title", "heading"}
+                or self._has_irregular_line_contour(segment.erase_bboxes)
+            )
         )
         source_size = self._source_font_size(segment)
         if is_dense_cleanup and not is_index_marker:
@@ -1548,6 +2209,25 @@ class LayoutPreservingRenderer:
                 source_size,
                 max(7.5, self.minimum_font_size * 2.15),
             )
+        if contour_flow:
+            contour_slots = sorted(
+                (
+                    [float(value) for value in box]
+                    for box in segment.erase_bboxes
+                    if len(box) == 4
+                    and float(box[2]) > float(box[0])
+                    and float(box[3]) > float(box[1])
+                ),
+                key=lambda box: (box[1], box[0]),
+            )
+            _, _, contour_fitted = self._fit_text_to_slots(
+                text,
+                contour_slots,
+                font_name,
+                source_size,
+            )
+            if not contour_fitted:
+                contour_flow = False
         if contour_flow:
             font_size, fitted = self._draw_contour_text(
                 pdf_canvas,
@@ -1570,8 +2250,22 @@ class LayoutPreservingRenderer:
                 background_mode=background_mode,
             )
 
-        available_width = height if rotated else width
-        available_height = width if rotated else height
+        if rotated:
+            available_width, available_height = self._oriented_box_dimensions(
+                width,
+                height,
+                rotation_degrees,
+                source_size,
+            )
+            available_height = self._rotated_single_line_height(
+                text,
+                available_width,
+                available_height,
+                font_name,
+                self.minimum_font_size,
+            )
+        else:
+            available_width, available_height = width, height
         font_size, paragraph, wrapped_height, fitted = self._fit_paragraph(
             text,
             available_width,
@@ -1588,10 +2282,14 @@ class LayoutPreservingRenderer:
             path.rect(x0, page_height - y1, width, height)
             pdf_canvas.clipPath(path, stroke=0, fill=0)
         if rotated:
-            pdf_canvas.translate(x1, page_height - y1)
-            pdf_canvas.rotate(90)
+            center_x = (x0 + x1) * 0.5
+            center_y = page_height - (y0 + y1) * 0.5
+            pdf_canvas.translate(center_x, center_y)
+            pdf_canvas.rotate(-rotation_degrees)
             paragraph.drawOn(
-                pdf_canvas, 0, max(0, available_height - wrapped_height)
+                pdf_canvas,
+                -available_width * 0.5,
+                available_height * 0.5 - wrapped_height,
             )
         else:
             paragraph.drawOn(
@@ -1613,16 +2311,108 @@ class LayoutPreservingRenderer:
         )
 
     @staticmethod
-    def _is_rotated_segment(segment: Segment, text: str) -> bool:
+    def _segment_rotation(segment: Segment, text: str) -> float:
+        if abs(segment.rotation_degrees) >= 3.0:
+            return PDFParser._normalize_rotation(segment.rotation_degrees)
         orientation_boxes = segment.erase_bboxes or [segment.bbox]
         first_box = orientation_boxes[0]
         first_width = max(float(first_box[2]) - float(first_box[0]), 1.0)
         first_height = max(float(first_box[3]) - float(first_box[1]), 1.0)
-        return (
+        inferred_vertical = (
             len(orientation_boxes) == 1
             and first_height > first_width * 1.45
             and len(text) <= 80
         )
+        return -90.0 if inferred_vertical else 0.0
+
+    @staticmethod
+    def _is_rotated_segment(segment: Segment, text: str) -> bool:
+        return abs(LayoutPreservingRenderer._segment_rotation(segment, text)) >= 3.0
+
+    @staticmethod
+    def _oriented_box_dimensions(
+        axis_width: float,
+        axis_height: float,
+        rotation_degrees: float,
+        source_font_size: float,
+    ) -> tuple[float, float]:
+        """Recover longitudinal length and line thickness from a rotated bbox."""
+
+        angle = math.radians(rotation_degrees)
+        cosine = abs(math.cos(angle))
+        sine = abs(math.sin(angle))
+        determinant = cosine * cosine - sine * sine
+        if abs(determinant) >= 0.12:
+            longitudinal = (cosine * axis_width - sine * axis_height) / determinant
+            thickness = (cosine * axis_height - sine * axis_width) / determinant
+        else:
+            # Around 45 degrees the axis-aligned bbox cannot uniquely recover
+            # both dimensions. The source font is a stable estimate of line
+            # thickness; infer the remaining longitudinal dimension.
+            thickness = max(1.0, source_font_size * 1.18)
+            candidates = []
+            if cosine > 0.05:
+                candidates.append((axis_width - sine * thickness) / cosine)
+            if sine > 0.05:
+                candidates.append((axis_height - cosine * thickness) / sine)
+            longitudinal = max(candidates, default=max(axis_width, axis_height))
+
+        thickness_cap = max(1.0, source_font_size * 1.45)
+        return (
+            max(1.0, longitudinal),
+            max(1.0, min(thickness, thickness_cap)),
+        )
+
+    @staticmethod
+    def _rotated_single_line_height(
+        text: str,
+        available_width: float,
+        available_height: float,
+        font_name: str,
+        minimum_font_size: float,
+    ) -> float:
+        """Account for Paragraph leading around a thin rotated text bbox.
+
+        Vector glyphs expose their ink bbox, while ReportLab's Paragraph
+        requires a full line box. A diagonal label can therefore fit visually
+        but fail preflight by less than one point. Expand only when the entire
+        translation fits on one line and the source ink box is already at
+        least 70% of the minimum font size.
+        """
+
+        content = text.strip()
+        paragraph_line_height = minimum_font_size * 1.02
+        if (
+            not content
+            or "\n" in content
+            or available_height >= paragraph_line_height
+            or available_height < minimum_font_size * 0.70
+            or pdfmetrics.stringWidth(
+                content,
+                font_name,
+                minimum_font_size,
+            )
+            > available_width + 0.1
+        ):
+            return available_height
+        return paragraph_line_height
+
+    @staticmethod
+    def _has_irregular_line_contour(boxes: list[list[float]]) -> bool:
+        """Detect a multiline label indented around nearby artwork."""
+
+        valid = [
+            [float(value) for value in box]
+            for box in boxes
+            if len(box) == 4
+            and float(box[2]) > float(box[0])
+            and float(box[3]) > float(box[1])
+        ]
+        if len(valid) < 2:
+            return False
+        median_height = float(np.median([max(1.0, box[3] - box[1]) for box in valid]))
+        left_edge_spread = max(box[0] for box in valid) - min(box[0] for box in valid)
+        return left_edge_spread >= max(12.0, median_height * 2.0)
 
     @staticmethod
     def _dense_page_detail(
@@ -1633,8 +2423,7 @@ class LayoutPreservingRenderer:
     ) -> dict[str, object] | None:
         source_characters = sum(len(segment.source_text) for segment in segments)
         source_lines = sum(
-            len(segment.erase_bboxes or [segment.bbox])
-            for segment in segments
+            len(segment.erase_bboxes or [segment.bbox]) for segment in segments
         )
         character_density = source_characters / max(width * height, 1)
         if source_lines < 240 and character_density < 0.012:
@@ -1655,8 +2444,16 @@ class LayoutPreservingRenderer:
         normalized = normalize_whitespace(text)
         return bool(
             re.search(r"[A-Za-z]", normalized)
-            and not re.fullmatch(r"[A-Z]", normalized)
+            and not re.fullmatch(r"[A-Z]{1,6}", normalized)
         )
+
+    @staticmethod
+    def _is_vector_segment(segment: Segment) -> bool:
+        if segment.source_kind == "pdf_text":
+            return True
+        if segment.source_kind == "ocr":
+            return False
+        return segment.font_name != "macOS Vision OCR"
 
     @classmethod
     def _dense_flat_page_cleanup(
@@ -1796,8 +2593,9 @@ class LayoutPreservingRenderer:
             size -= 0.25
         return self.minimum_font_size, last_lines, False
 
-    @staticmethod
+    @classmethod
     def _pack_text_into_slots(
+        cls,
         text: str,
         slots: list[list[float]],
         font_name: str,
@@ -1822,21 +2620,39 @@ class LayoutPreservingRenderer:
                     break
                 candidate = content[start : end + 1]
                 if (
-                    pdfmetrics.stringWidth(
-                        candidate, font_name, font_size
-                    )
+                    pdfmetrics.stringWidth(candidate, font_name, font_size)
                     > available_width + 0.1
                 ):
                     break
                 end += 1
             if end == start:
                 end = min(len(content), start + 1)
+            elif (
+                end < len(content)
+                and cls._is_ascii_word_character(content[end - 1])
+                and cls._is_ascii_word_character(content[end])
+            ):
+                token_start = end
+                while token_start > start and cls._is_ascii_word_character(
+                    content[token_start - 1]
+                ):
+                    token_start -= 1
+                if token_start > start:
+                    end = token_start
 
             lines.append(content[start:end].rstrip())
             cursor = end
             if cursor < len(content) and content[cursor] == "\n":
                 cursor += 1
         return lines, cursor
+
+    @staticmethod
+    def _is_ascii_word_character(character: str) -> bool:
+        return bool(
+            character
+            and character.isascii()
+            and (character.isalnum() or character in "./:%+-")
+        )
 
     def _fit_paragraph(
         self,
@@ -1851,15 +2667,17 @@ class LayoutPreservingRenderer:
         start = max(self.minimum_font_size, min(34.0, source_size * 1.08))
         if block_type in {"title", "heading"}:
             start = min(36.0, max(start, source_size))
-        size = start
         escaped = html.escape(text).replace("\n", "<br/>")
-        last: tuple[Paragraph, float] | None = None
-        while size >= self.minimum_font_size - 0.01:
+
+        def build(
+            size: float,
+            leading_ratio: float,
+        ) -> tuple[Paragraph, float]:
             style = ParagraphStyle(
-                f"Replacement-{size:.2f}",
+                f"Replacement-{size:.3f}-{leading_ratio:.2f}",
                 fontName=font_name,
                 fontSize=size,
-                leading=size * 1.18,
+                leading=size * leading_ratio,
                 textColor=colors.Color(*text_color),
                 alignment=TA_LEFT,
                 wordWrap="CJK",
@@ -1869,24 +2687,74 @@ class LayoutPreservingRenderer:
             )
             paragraph = Paragraph(escaped, style)
             _, wrapped_height = paragraph.wrap(width, 100000)
-            last = (paragraph, wrapped_height)
-            if wrapped_height <= height + 0.35:
-                return size, paragraph, wrapped_height, True
-            size -= 0.25
+            return paragraph, wrapped_height
 
-        assert last is not None
-        paragraph, wrapped_height = last
-        return self.minimum_font_size, paragraph, wrapped_height, False
+        candidates: list[tuple[float, float, Paragraph, float]] = []
+        for leading_ratio in (1.18, 1.12, 1.06, 1.02):
+            minimum_paragraph, minimum_height = build(
+                self.minimum_font_size,
+                leading_ratio,
+            )
+            if minimum_height > height + 0.35:
+                continue
+            low = self.minimum_font_size
+            high = start
+            best_size = self.minimum_font_size
+            best_paragraph = minimum_paragraph
+            best_height = minimum_height
+            for _ in range(14):
+                middle = (low + high) / 2
+                paragraph, wrapped_height = build(middle, leading_ratio)
+                if wrapped_height <= height + 0.35:
+                    best_size = middle
+                    best_paragraph = paragraph
+                    best_height = wrapped_height
+                    low = middle
+                else:
+                    high = middle
+            candidates.append(
+                (
+                    best_size,
+                    leading_ratio,
+                    best_paragraph,
+                    best_height,
+                )
+            )
+
+        if candidates:
+            size, _, paragraph, wrapped_height = max(
+                candidates,
+                key=lambda item: (item[0], item[1]),
+            )
+            return size, paragraph, wrapped_height, True
+
+        paragraph, wrapped_height = build(self.minimum_font_size, 1.02)
+        return (
+            self.minimum_font_size,
+            paragraph,
+            wrapped_height,
+            False,
+        )
 
     @staticmethod
     def _source_font_size(segment: Segment) -> float:
-        heights = [
-            max(0.1, float(box[3]) - float(box[1]))
+        rotation = math.radians(
+            LayoutPreservingRenderer._segment_rotation(segment, segment.source_text)
+        )
+        thicknesses = [
+            max(
+                0.1,
+                abs((float(box[2]) - float(box[0])) * math.sin(rotation))
+                + abs((float(box[3]) - float(box[1])) * math.cos(rotation)),
+            )
             for box in segment.erase_bboxes
             if len(box) == 4
         ]
-        geometry_size = float(np.median(heights)) * 0.92 if heights else 0.0
-        return max(5.0, segment.font_size or 0.0, geometry_size)
+        geometry_size = float(np.median(thicknesses)) * 0.92 if thicknesses else 0.0
+        declared_size = segment.font_size or 0.0
+        if declared_size > 0:
+            geometry_size = min(geometry_size, declared_size * 1.35)
+        return max(5.0, declared_size, geometry_size)
 
     @classmethod
     def _text_color(
@@ -1905,9 +2773,7 @@ class LayoutPreservingRenderer:
             px1 = min(page_array.shape[1], int(math.ceil(x1 * scale_x)))
             py1 = min(page_array.shape[0], int(math.ceil(y1 * scale_y)))
             if px1 > px0 and py1 > py0:
-                border = cls._border_pixels(
-                    page_array, px0, py0, px1, py1
-                )
+                border = cls._border_pixels(page_array, px0, py0, px1, py1)
                 background, _ = cls._robust_background(border)
                 background_luminance = float(
                     background[0] * 0.2126
@@ -1915,9 +2781,7 @@ class LayoutPreservingRenderer:
                     + background[2] * 0.0722
                 )
                 crop = page_array[py0:py1, px0:px1]
-                dark, light = cls._ink_scores(
-                    crop, background_luminance
-                )
+                dark, light = cls._ink_scores(crop, background_luminance)
                 dark_score += dark
                 light_score += light
         return (
@@ -1927,12 +2791,8 @@ class LayoutPreservingRenderer:
         )
 
     @classmethod
-    def _ink_polarity(
-        cls, crop: np.ndarray, background_luminance: float
-    ) -> str:
-        dark_score, light_score = cls._ink_scores(
-            crop, background_luminance
-        )
+    def _ink_polarity(cls, crop: np.ndarray, background_luminance: float) -> str:
+        dark_score, light_score = cls._ink_scores(crop, background_luminance)
         return "light" if light_score > dark_score * 1.08 else "dark"
 
     @staticmethod
@@ -1974,9 +2834,7 @@ class LayoutPreservingRenderer:
             return np.array([255.0, 255.0, 255.0]), 0.0
         pixels = border.astype(np.float32)
         luminance = (
-            pixels[:, 0] * 0.2126
-            + pixels[:, 1] * 0.7152
-            + pixels[:, 2] * 0.0722
+            pixels[:, 0] * 0.2126 + pixels[:, 1] * 0.7152 + pixels[:, 2] * 0.0722
         )
         median_luminance = float(np.median(luminance))
         if median_luminance >= 120:
@@ -2102,17 +2960,17 @@ th,td{{text-align:left;border-bottom:1px solid #ddd;padding:9px;vertical-align:t
 .passed{{color:#216557}} .review{{color:#a23d34}}
 </style>
 <h1>原版面替换质量报告</h1>
-<p class="{'passed' if str(payload['status']).startswith('passed') else 'review'}">
-状态：{html.escape(str(payload['status']))}</p>
+<p class="{"passed" if str(payload["status"]).startswith("passed") else "review"}">
+状态：{html.escape(str(payload["status"]))}</p>
 <div class="grid">
-<div class="card">替换段落<b>{payload['replaced_segments']}</b></div>
-<div class="card">溢出错误<b>{payload['overflow_errors']}</b></div>
-<div class="card">复杂背景修补<b>{payload['complex_background_repairs']}</b></div>
-<div class="card">绕图段落<b>{payload.get('contour_flow_segments', 0)}</b></div>
-<div class="card">最小字号<b>{payload['minimum_rendered_font_size']}</b></div>
-<div class="card">高密度待复核页<b>{len(payload.get('dense_pages_requiring_review', []))}</b></div>
+<div class="card">替换段落<b>{payload["replaced_segments"]}</b></div>
+<div class="card">溢出错误<b>{payload["overflow_errors"]}</b></div>
+<div class="card">复杂背景修补<b>{payload["complex_background_repairs"]}</b></div>
+<div class="card">绕图段落<b>{payload.get("contour_flow_segments", 0)}</b></div>
+<div class="card">最小字号<b>{payload["minimum_rendered_font_size"]}</b></div>
+<div class="card">高密度待复核页<b>{len(payload.get("dense_pages_requiring_review", []))}</b></div>
 </div>
-<p>{html.escape(str(payload['note']))}</p>
+<p>{html.escape(str(payload["note"]))}</p>
 <table><thead><tr><th>级别</th><th>段落</th><th>信息</th></tr></thead>
 <tbody>{issue_rows or '<tr><td colspan="3">无校验问题</td></tr>'}</tbody></table>
 <details><summary>完整 JSON</summary><pre>{html.escape(json.dumps(payload, ensure_ascii=False, indent=2))}</pre></details>

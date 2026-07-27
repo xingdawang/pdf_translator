@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install CJK font
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes fonts-noto-cjk
+      - name: Install project
+        run: python -m pip install -e ".[dev]"
+      - name: Static checks
+        run: |
+          python -m compileall -q src
+          ruff check src tests
+          mypy src/pdf_translator/config.py src/pdf_translator/models.py src/pdf_translator/repository.py src/pdf_translator/xlsx_io.py
+      - name: Test
+        run: pytest

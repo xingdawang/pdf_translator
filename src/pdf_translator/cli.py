@@ -5,7 +5,7 @@ import json
 import subprocess
 import sys
 
-from .config import AppConfig
+from .config import AppConfig, DEFAULT_DPI, DPI_CHOICES
 from .exceptions import PDFTranslatorError
 from .models import TaskSettings
 from .utils import file_size_label
@@ -36,7 +36,7 @@ def _settings(args: argparse.Namespace) -> TaskSettings:
         page_end=getattr(args, "page_end", None),
         protected_terms=terms,
         ocr_mode=getattr(args, "ocr", "off"),
-        ocr_dpi=getattr(args, "ocr_dpi", 170),
+        ocr_dpi=getattr(args, "ocr_dpi", DEFAULT_DPI),
     )
 
 
@@ -73,8 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--ocr-dpi",
             type=int,
-            default=170,
-            choices=(120, 170, 240, 300),
+            default=DEFAULT_DPI,
+            choices=DPI_CHOICES,
             help="OCR 渲染清晰度",
         )
         command.add_argument(
@@ -120,8 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument(
         "--layout-dpi",
         type=int,
-        default=170,
-        choices=(170, 200, 220, 240, 260),
+        default=DEFAULT_DPI,
+        choices=DPI_CHOICES,
     )
     generate.add_argument("--font", help="中文字体文件路径")
 

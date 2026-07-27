@@ -45,8 +45,9 @@
         </label>
         <label data-ocr-dpi-field>OCR 清晰度
           <select name="ocr_dpi" data-ocr-dpi>
-            <option value="170" selected>170 DPI · 推荐</option>
-            <option value="240">240 DPI · 小字</option>
+            {% for dpi in dpi_choices %}
+              <option value="{{ dpi }}"{% if dpi == default_dpi %} selected{% endif %}>{{ dpi }} DPI · {{ dpi_profiles[dpi].ocr_label }}</option>
+            {% endfor %}
           </select>
           <small class="field-note" data-ocr-dpi-hint>仅在图片页面需要 OCR 时生效。</small>
         </label>

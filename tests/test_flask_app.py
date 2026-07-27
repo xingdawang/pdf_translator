@@ -62,9 +62,11 @@ def test_index_renders_lightweight_local_ui(tmp_path):
     assert 'name="page_end"' in response.get_data(as_text=True)
     assert '<option value="vision" selected>' in response.get_data(as_text=True)
     assert "自动识别（推荐）" in response.get_data(as_text=True)
-    assert '<option value="170" selected>170 DPI · 推荐</option>' in response.get_data(
+    assert '<option value="200" selected>200 DPI · 推荐</option>' in response.get_data(
         as_text=True
     )
+    assert "170 DPI · 更省资源" in response.get_data(as_text=True)
+    assert "240 DPI · 小字/复杂页面" in response.get_data(as_text=True)
     assert "150 DPI" not in response.get_data(as_text=True)
     assert "翻译范围与术语" not in response.get_data(as_text=True)
     assert 'name="protected_terms"' not in response.get_data(as_text=True)
@@ -191,8 +193,8 @@ def test_task_page_uses_simplified_four_step_workflow(tmp_path):
     assert "保存修改并重新检查" not in content
     assert "确认无误" not in content
     assert "选择 Google 下载的 XLSX" in content
-    assert "正式输出 · 170 DPI（推荐）" in content
-    assert "高清输出 · 200 DPI" in content
+    assert "轻量输出 · 170 DPI" in content
+    assert "标准输出 · 200 DPI（推荐）" in content
     assert "精细输出 · 240 DPI（小字/复杂背景）" in content
     assert "150 DPI" not in content
     assert "不影响 OCR 识别或中文矢量文字清晰度" in content
@@ -211,6 +213,47 @@ def test_task_page_uses_simplified_four_step_workflow(tmp_path):
     assert "自定义中文字体" not in content
     assert "原版面替换质量报告" not in content
     assert "原版面质量数据 JSON" not in content
+    assert "检查段落结构" in content
+
+
+def test_structure_view_renders_ir_overlay_and_source_page(tmp_path):
+    app = create_app(AppConfig.from_env(tmp_path / "data"))
+    app.config.update(TESTING=True)
+    workflow = app.extensions["translation_workflow"]
+    task = workflow.create_task(create_sample_pdf(tmp_path / "sample.pdf"))
+
+    with app.test_client() as client:
+        structure = client.get(f"/tasks/{task.task_id}/structure?page=1")
+        source_page = client.get(
+            f"/tasks/{task.task_id}/structure/pages/1.png"
+        )
+
+    assert structure.status_code == 200
+    content = structure.get_data(as_text=True)
+    assert "段落与定位结构" in content
+    assert 'class="structure-box' in content
+    assert "P0001-S000001" in content
+    assert source_page.status_code == 200
+    assert source_page.mimetype == "image/png"
+
+
+def test_unavailable_historical_layout_dpi_is_kept_in_history_but_not_offered(
+    tmp_path,
+):
+    app = create_app(AppConfig.from_env(tmp_path / "data"))
+    app.config.update(TESTING=True)
+    workflow = app.extensions["translation_workflow"]
+    task = workflow.create_task(create_sample_pdf(tmp_path / "sample.pdf"))
+    task.last_generation = {"layout_dpi": 180, "output_mode": "layout"}
+    workflow.repository.save(task)
+
+    with app.test_client() as client:
+        content = client.get(f"/tasks/{task.task_id}").get_data(as_text=True)
+
+    stored = workflow.repository.load(task.task_id)
+    assert stored.last_generation["layout_dpi"] == 180
+    assert '<option value="200" selected>' in content
+    assert '<option value="180"' not in content
 
 
 def test_generate_rejects_unknown_output_mode_and_reports_are_not_downloadable(

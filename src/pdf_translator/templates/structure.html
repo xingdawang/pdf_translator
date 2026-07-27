@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+{% block title %}结构检查 · {{ task.source_filename }}{% endblock %}
+{% block content %}
+<div class="structure-heading">
+  <div>
+    <a class="back-link" href="{{ url_for('task_detail', task_id=task.task_id) }}">← 返回任务</a>
+    <h1>段落与定位结构</h1>
+    <p>第 {{ page_number }} 页 · {{ anchors|length }} 个视觉锚点。方框表示轻量 IR 保存的版面位置。</p>
+  </div>
+  <nav class="page-switcher" aria-label="切换页面">
+    {% if previous_page %}
+      <a class="button secondary compact" href="{{ url_for('task_structure', task_id=task.task_id, page=previous_page) }}">← 第 {{ previous_page }} 页</a>
+    {% endif %}
+    {% if next_page %}
+      <a class="button secondary compact" href="{{ url_for('task_structure', task_id=task.task_id, page=next_page) }}">第 {{ next_page }} 页 →</a>
+    {% endif %}
+  </nav>
+</div>
+
+<div class="structure-grid">
+  <section class="structure-canvas" style="aspect-ratio: {{ page_width }} / {{ page_height }};">
+    <img
+      src="{{ url_for('task_structure_page', task_id=task.task_id, page_number=page_number) }}"
+      alt="原 PDF 第 {{ page_number }} 页"
+    >
+    <svg viewBox="0 0 {{ page_width }} {{ page_height }}" role="img" aria-label="段落定位框">
+      {% for anchor in anchors %}
+        <a href="#{{ anchor.anchor_id }}">
+          <rect
+            class="structure-box{% if anchor.continuation %} continuation{% endif %}"
+            x="{{ anchor.x }}" y="{{ anchor.y }}"
+            width="{{ anchor.width }}" height="{{ anchor.height }}"
+          />
+          <text x="{{ anchor.x + 2 }}" y="{{ anchor.y + 9 }}">{{ anchor.reading_order }}</text>
+        </a>
+      {% endfor %}
+    </svg>
+  </section>
+
+  <aside class="structure-legend">
+    <h2>本页锚点</h2>
+    <p><span class="legend-swatch"></span>单个版面段落 <span class="legend-swatch linked"></span>跨视觉区域的语义段落</p>
+    <div class="anchor-list">
+      {% for anchor in anchors %}
+        <article id="{{ anchor.anchor_id }}">
+          <header>
+            <code>{{ anchor.paragraph_id }}</code>
+            <span>#{{ anchor.reading_order }} · {{ anchor.layout_label }}{% if anchor.column_id > 0 %} · 第 {{ anchor.column_id }} 栏{% endif %}</span>
+          </header>
+          {% if anchor.continuation %}<strong>{{ anchor.continuation }}</strong>{% endif %}
+          <p>{{ anchor.source_text|truncate(220, true) }}</p>
+        </article>
+      {% else %}
+        <div class="empty-state">这一页没有提取到文字锚点。</div>
+      {% endfor %}
+    </div>
+  </aside>
+</div>
+{% endblock %}

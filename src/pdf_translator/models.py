@@ -3,6 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from .config import DEFAULT_DPI
+
+DOCUMENT_IR_VERSION = 2
+
 
 @dataclass
 class Placeholder:
@@ -13,6 +17,61 @@ class Placeholder:
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Placeholder":
         return cls(**data)
+
+
+@dataclass
+class ParagraphAnchor:
+    """One visual container occupied by a semantic paragraph."""
+
+    anchor_id: str
+    page_number: int
+    reading_order: int
+    bbox: list[float]
+    erase_bboxes: list[list[float]] = field(default_factory=list)
+    source_text: str = ""
+    column_id: int = 0
+    layout_label: str = "paragraph"
+    rotation_degrees: float = 0.0
+    source_kind: str = "legacy"
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "ParagraphAnchor":
+        return cls(**data)
+
+
+@dataclass
+class PageIR:
+    page_number: int
+    width: float
+    height: float
+    rotation: int = 0
+    mediabox: list[float] = field(default_factory=list)
+    cropbox: list[float] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "PageIR":
+        return cls(**data)
+
+
+@dataclass
+class DocumentIR:
+    """Lightweight document structure shared by parsing and rendering stages.
+
+    Paragraph content lives in ``TranslationTask.segments`` for backwards
+    compatibility.  This object records page geometry and the schema version;
+    each Segment carries its ordered visual anchors.
+    """
+
+    version: int = DOCUMENT_IR_VERSION
+    pages: list[PageIR] = field(default_factory=list)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any] | None) -> "DocumentIR | None":
+        if not data:
+            return None
+        payload = dict(data)
+        payload["pages"] = [PageIR.from_dict(item) for item in payload.get("pages", [])]
+        return cls(**payload)
 
 
 @dataclass
@@ -35,6 +94,13 @@ class Segment:
     status: str = "pending"
     warnings: list[str] = field(default_factory=list)
     fallback_reason: str | None = None
+    paragraph_id: str = ""
+    anchors: list[ParagraphAnchor] = field(default_factory=list)
+    layout_label: str = ""
+    column_id: int = 0
+    continuation: str | None = None
+    rotation_degrees: float = 0.0
+    source_kind: str = "legacy"
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "Segment":
@@ -42,7 +108,29 @@ class Segment:
         payload["placeholders"] = [
             Placeholder.from_dict(item) for item in payload.get("placeholders", [])
         ]
+        payload["anchors"] = [
+            ParagraphAnchor.from_dict(item) for item in payload.get("anchors", [])
+        ]
         return cls(**payload)
+
+    @property
+    def visual_anchors(self) -> list[ParagraphAnchor]:
+        if self.anchors:
+            return self.anchors
+        return [
+            ParagraphAnchor(
+                anchor_id=f"{self.segment_id}-A001",
+                page_number=self.page_number,
+                reading_order=self.reading_order,
+                bbox=list(self.bbox),
+                erase_bboxes=[list(box) for box in (self.erase_bboxes or [self.bbox])],
+                source_text=self.source_text,
+                column_id=self.column_id,
+                layout_label=self.layout_label or self.block_type,
+                rotation_degrees=self.rotation_degrees,
+                source_kind=self.source_kind,
+            )
+        ]
 
 
 @dataclass
@@ -69,7 +157,7 @@ class TaskSettings:
     page_end: int | None = None
     protected_terms: list[str] = field(default_factory=list)
     ocr_mode: str = "off"
-    ocr_dpi: int = 170
+    ocr_dpi: int = DEFAULT_DPI
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "TaskSettings":
@@ -100,6 +188,12 @@ class TranslationTask:
     review_confirmation: dict[str, Any] | None = None
     source_page_count: int | None = None
     last_generation: dict[str, Any] | None = None
+    source_mtime_ns: int | None = None
+    segment_count: int | None = None
+    translated_segment_count: int | None = None
+    source_fallback_count: int | None = None
+    storage_size_bytes: int = 0
+    document_ir: DocumentIR | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -112,9 +206,9 @@ class TranslationTask:
             Segment.from_dict(item) for item in payload.get("segments", [])
         ]
         payload["export_packages"] = [
-            ExportPackage.from_dict(item)
-            for item in payload.get("export_packages", [])
+            ExportPackage.from_dict(item) for item in payload.get("export_packages", [])
         ]
+        payload["document_ir"] = DocumentIR.from_dict(payload.get("document_ir"))
         return cls(**payload)
 
     @property
@@ -123,6 +217,8 @@ class TranslationTask:
 
     @property
     def translated_count(self) -> int:
+        if not self.segments and self.translated_segment_count is not None:
+            return self.translated_segment_count
         return sum(
             bool(segment.translated_text.strip())
             for segment in self.translatable_segments

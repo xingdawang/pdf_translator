@@ -91,6 +91,22 @@ def test_export_import_survives_translated_headers_and_sheet_name(tmp_path):
     assert report.can_generate
 
 
+def test_stable_paragraph_row_keys_round_trip_exactly(tmp_path):
+    task = make_task()
+    for segment in task.segments:
+        segment.row_key = segment.segment_id
+        segment.paragraph_id = segment.segment_id
+    packages = XLSXExporter().export(task, tmp_path)
+    task.export_packages = packages
+    translated = tmp_path / "paragraph-ids.xlsx"
+    translate_workbook(tmp_path / packages[0].filename, translated)
+
+    result = XLSXImporter().import_file(task, translated)
+
+    assert result.exact_matches == len(task.segments)
+    assert result.positional_matches == 0
+
+
 def test_missing_row_is_detected(tmp_path):
     task = make_task()
     packages = XLSXExporter().export(task, tmp_path)
