@@ -9,4 +9,4 @@ if [[ ! -x ".venv/bin/python" ]]; then
   exit 1
 fi
 
-exec ".venv/bin/python" -m pdf_translator.hybrid_app
+exec ".venv/bin/python" -m pdf_translator.hybrid_app --host 0.0.0.0 --port 5050

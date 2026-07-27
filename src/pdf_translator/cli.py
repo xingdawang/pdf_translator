@@ -127,7 +127,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     subcommands.add_parser("list", help="列出任务")
     ui = subcommands.add_parser("ui", help="启动本地 Flask 网页")
-    ui.add_argument("--host", default="127.0.0.1")
+    ui.add_argument("--host", default="0.0.0.0")
     ui.add_argument("--port", default=5050, type=int)
     ui.add_argument("--no-browser", action="store_true")
     return parser
