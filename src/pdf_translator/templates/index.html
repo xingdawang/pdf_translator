@@ -4,7 +4,7 @@
   <div>
     <p class="eyebrow">PDF → 中文 · 本地优先</p>
     <h1>保留原版面，把英文 PDF 转成中文</h1>
-    <p class="lede">选择本地 PDF 和页码范围，程序会识别文字并生成翻译包；把 Google Translate 返回的 XLSX 导入后，即可在原页面位置生成中文版 PDF。原 PDF 和图片始终留在本机。</p>
+    <p class="lede">在服务器 Mac 本机访问时，可以直接选择本地路径；从其他电脑访问时，浏览器会先通过局域网上传 PDF，再由服务器分析。把 Google Translate 返回的 XLSX 导入后，即可在原页面位置生成中文版 PDF。</p>
   </div>
 </section>
 
@@ -16,12 +16,13 @@
     </div>
     <form action="{{ url_for('analyze') }}" method="post" class="job-form" data-job-form data-kind="analyze" data-analysis-form>
       <div class="path-picker">
-        <label>本地 PDF 绝对路径
+        <label><span data-source-label>本地 PDF 绝对路径</span>
           <input name="source_path" type="text" required placeholder="/Users/you/Downloads/book.pdf" autocomplete="off" data-source-path>
         </label>
         <button class="button secondary" type="button" data-select-pdf>选择 PDF 文件</button>
+        <input type="file" accept="application/pdf,.pdf" data-browser-pdf hidden>
       </div>
-      <p class="field-hint" data-path-status>可以点击选择，也可以粘贴带单引号或双引号的路径。</p>
+      <p class="field-hint" data-path-status>正在判断当前是本机访问还是远程访问…</p>
       <div class="field-grid">
         <label>开始页
           <input name="page_start" type="number" min="1" step="1" value="1" required data-page-start>
@@ -84,7 +85,7 @@
           <em>{{ status_labels.get(task.status, task.status) }}</em>
         </a>
       {% else %}
-        <div class="empty-state">还没有任务。填入左侧路径即可开始。</div>
+        <div class="empty-state">还没有任务。选择一个 PDF 即可开始。</div>
       {% endfor %}
     </div>
     <nav class="history-pagination" aria-label="任务历史翻页">
