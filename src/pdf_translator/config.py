@@ -16,7 +16,7 @@ class AppConfig:
     max_package_bytes: int = 9_500_000
     minimum_text_characters_per_page: int = 20
     minimum_text_page_ratio: float = 0.20
-    render_dpi: int = 120
+    render_dpi: int = 170
 
     @classmethod
     def from_env(cls, data_dir: str | Path | None = None) -> "AppConfig":

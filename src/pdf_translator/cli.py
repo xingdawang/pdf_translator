@@ -36,7 +36,7 @@ def _settings(args: argparse.Namespace) -> TaskSettings:
         page_end=getattr(args, "page_end", None),
         protected_terms=terms,
         ocr_mode=getattr(args, "ocr", "off"),
-        ocr_dpi=getattr(args, "ocr_dpi", 180),
+        ocr_dpi=getattr(args, "ocr_dpi", 170),
     )
 
 
@@ -73,8 +73,8 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument(
             "--ocr-dpi",
             type=int,
-            default=180,
-            choices=(120, 150, 180, 240, 300),
+            default=170,
+            choices=(120, 170, 240, 300),
             help="OCR 渲染清晰度",
         )
         command.add_argument(
@@ -120,8 +120,8 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument(
         "--layout-dpi",
         type=int,
-        default=200,
-        choices=(150, 170, 200, 220, 240, 260),
+        default=170,
+        choices=(170, 200, 220, 240, 260),
     )
     generate.add_argument("--font", help="中文字体文件路径")
 

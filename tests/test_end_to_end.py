@@ -102,7 +102,7 @@ def test_quoted_path_and_page_range_generate_only_selected_pages(tmp_path):
         chinese=False,
         bilingual=False,
         layout=True,
-        layout_dpi=150,
+        layout_dpi=170,
     )
 
     assert len(PdfReader(str(outputs.layout_pdf)).pages) == 1
@@ -128,7 +128,7 @@ def test_source_and_layout_output_interleaves_matching_pages_and_reuses_cache(
         bilingual=False,
         layout=False,
         source_layout=True,
-        layout_dpi=150,
+        layout_dpi=170,
     )
 
     assert outputs.source_layout_pdf is not None
@@ -173,7 +173,7 @@ def test_source_and_layout_output_interleaves_matching_pages_and_reuses_cache(
         bilingual=False,
         layout=False,
         source_layout=True,
-        layout_dpi=150,
+        layout_dpi=170,
     )
     assert cached.source_layout_cache_hit
     assert cached.source_layout_pdf.stat().st_mtime_ns == first_mtime

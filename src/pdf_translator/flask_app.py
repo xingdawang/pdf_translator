@@ -290,7 +290,7 @@ def create_app(config: AppConfig | None = None) -> Flask:
             ],
             ocr_mode=request.form.get("ocr_mode", "vision"),
             ocr_dpi=_bounded_int(
-                request.form.get("ocr_dpi"), default=180, minimum=120, maximum=300
+                request.form.get("ocr_dpi"), default=170, minimum=120, maximum=300
             ),
         )
 
@@ -504,8 +504,8 @@ def create_app(config: AppConfig | None = None) -> Flask:
         output_mode = request.form.get("output_mode", "layout")
         layout_dpi = _bounded_int(
             request.form.get("layout_dpi"),
-            default=200,
-            minimum=150,
+            default=170,
+            minimum=170,
             maximum=260,
         )
         if output_mode not in {"layout", "source_layout"}:

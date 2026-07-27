@@ -97,12 +97,24 @@ def test_layout_renderer_preserves_page_and_reports_fit(tmp_path):
     assert len(reader.pages) == 1
     assert float(reader.pages[0].mediabox.width) == 300
     assert float(reader.pages[0].mediabox.height) == 200
+    contents = reader.pages[0]["/Contents"].get_object()
+    assert contents.get("/Filter") == "/FlateDecode"
+    assert len(contents._data) < len(contents.get_data())
+    image_filters = [
+        str(item.get_object().get("/Filter"))
+        for item in reader.pages[0]["/Resources"].get("/XObject", {}).values()
+        if item.get_object().get("/Subtype") == "/Image"
+    ]
+    assert image_filters
+    assert all("ASCII85Decode" not in item for item in image_filters)
     assert outputs.replaced_segments == 1
     assert outputs.overflow_errors == 0
-    report = outputs.quality_json.read_text(encoding="utf-8")
-    assert '"page_sizes_preserved": true' in report
-    assert '"status": "passed"' in report
-    assert '"contour_flow_segments": 1' in report
+    report = json.loads(outputs.quality_json.read_text(encoding="utf-8"))
+    assert report["page_sizes_preserved"]
+    assert report["status"] == "passed"
+    assert report["contour_flow_segments"] == 1
+    assert report["repair_image_layers"] == 1
+    assert report["repair_image_tiles"] >= 1
     assert outputs.quality_html.exists()
 
 
@@ -196,6 +208,34 @@ def test_layout_stress_text_does_not_count_index_numbers_twice():
     text = make_stress_text("agate 88, 96, 108, 219", [], 0.4)
 
     assert text == "排版"
+
+
+def test_repair_patch_clusters_stay_local_and_bounded():
+    patch = np.zeros((10, 10, 4), dtype=np.uint8)
+    patch[:, :, :3] = 240
+    patch[:, :, 3] = 255
+    patches = [
+        ((0, 0, 10, 10), patch),
+        ((12, 0, 22, 10), patch),
+        ((100, 100, 110, 110), patch),
+        ((200, 200, 210, 210), patch),
+    ]
+
+    groups = LayoutPreservingRenderer._cluster_repair_patches(
+        patches,
+        gap=3,
+        maximum_groups=3,
+    )
+
+    assert len(groups) == 3
+    assert any(group[0] == (0, 0, 22, 10) for group in groups)
+    assert sum(len(group[1]) for group in groups) == len(patches)
+    bounded = LayoutPreservingRenderer._cluster_repair_patches(
+        patches,
+        gap=3,
+        maximum_groups=2,
+    )
+    assert len(bounded) == 2
 
 
 def test_dense_index_page_is_identified_for_manual_review(tmp_path):

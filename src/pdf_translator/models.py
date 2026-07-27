@@ -69,7 +69,7 @@ class TaskSettings:
     page_end: int | None = None
     protected_terms: list[str] = field(default_factory=list)
     ocr_mode: str = "off"
-    ocr_dpi: int = 180
+    ocr_dpi: int = 170
 
     @classmethod
     def from_dict(cls, data: dict[str, Any] | None) -> "TaskSettings":
