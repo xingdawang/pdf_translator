@@ -71,7 +71,7 @@ def create_sample_pdf(path: Path) -> Path:
     intro = (
         "PDF files combine text, fonts, vector graphics, raster images, and page geometry. "
         "A safe translator should preserve content even when the original layout cannot be reused. "
-        "For that reason, this MVP generates readable flow-layout pages and a bilingual review file."
+        "For that reason, this workflow generates readable flow-layout pages and a bilingual review file."
     )
     y = height - 184 * mm
     for line in textwrap.wrap(intro, width=104):

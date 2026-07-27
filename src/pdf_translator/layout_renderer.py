@@ -23,6 +23,7 @@ import numpy as np
 import cv2
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from reportlab import rl_config
 from reportlab.lib import colors
 from reportlab.lib.enums import TA_LEFT
 from reportlab.lib.styles import ParagraphStyle
@@ -39,8 +40,14 @@ from .utils import atomic_write_json, normalize_whitespace, safe_stem, utc_now
 
 
 ProgressCallback = Callable[[int, int], None]
-LAYOUT_RENDERER_VERSION = "5.0-batched-parallel"
+LAYOUT_RENDERER_VERSION = "5.1.2-compact-repair-layers"
 PARALLEL_PAGE_THRESHOLD = 4
+MAX_REPAIR_TILES_PER_PAGE = 16
+
+# PDF streams are binary-safe. ASCII85 adds roughly 25% transport overhead to
+# every raster repair layer without improving compatibility for the files we
+# generate.
+rl_config.useA85 = 0
 
 
 @dataclass
@@ -95,13 +102,18 @@ class _PageRenderRequest:
 
 
 @dataclass
+class _RepairImage:
+    path: str
+    bbox: list[float]
+
+
+@dataclass
 class _PageRenderResult:
     selected_index: int
     page_number: int
     width: float
     height: float
-    repair_image_path: str | None
-    repair_image_bbox: list[float] | None
+    repair_images: list[_RepairImage]
     dense_cleanup: tuple[list[float], tuple[float, float, float]] | None
     prepared: list[_PreparedTranslation]
     placements_expected: int
@@ -116,7 +128,7 @@ class LayoutPreservingRenderer:
     def __init__(
         self,
         font_path: str | Path | None = None,
-        render_dpi: int = 200,
+        render_dpi: int = 170,
         minimum_font_size: float = 3.5,
         max_workers: int | None = None,
     ):
@@ -350,11 +362,9 @@ class LayoutPreservingRenderer:
                 erase_boxes=repair_boxes,
             )
 
-        repair_layer = Image.new(
-            "RGBA",
-            (pixmap.width, pixmap.height),
-            (0, 0, 0, 0),
-        )
+        repair_patches: list[
+            tuple[tuple[int, int, int, int], np.ndarray]
+        ] = []
         prepared: list[_PreparedTranslation] = []
         complex_backgrounds = 0
         for segment in page_segments:
@@ -387,10 +397,7 @@ class LayoutPreservingRenderer:
                     )
                 )
                 if patch is not None and pixel_bbox is not None:
-                    repair_layer.alpha_composite(
-                        Image.fromarray(patch, mode="RGBA"),
-                        dest=(pixel_bbox[0], pixel_bbox[1]),
-                    )
+                    repair_patches.append((pixel_bbox, patch))
             complex_backgrounds += int("complex" in background_mode)
             color = (
                 (0.06, 0.06, 0.06)
@@ -417,36 +424,24 @@ class LayoutPreservingRenderer:
                 )
             )
 
-        repair_image_path: str | None = None
-        repair_image_bbox: list[float] | None = None
-        alpha_bbox = repair_layer.getbbox()
-        if dense_cleanup is None and alpha_bbox is not None:
-            repair_path = (
-                temp_dir
-                / f"repair-page-{request.selected_index:06d}.png"
+        repair_images = (
+            self._write_repair_tiles(
+                repair_patches,
+                temp_dir=temp_dir,
+                selected_index=request.selected_index,
+                scale_x=scale_x,
+                scale_y=scale_y,
             )
-            repair_layer.crop(alpha_bbox).save(
-                repair_path,
-                format="PNG",
-                optimize=False,
-                compress_level=3,
-            )
-            repair_image_path = str(repair_path)
-            left, top, right, bottom = alpha_bbox
-            repair_image_bbox = [
-                left / scale_x,
-                top / scale_y,
-                right / scale_x,
-                bottom / scale_y,
-            ]
+            if dense_cleanup is None
+            else []
+        )
 
         return _PageRenderResult(
             selected_index=request.selected_index,
             page_number=request.page_number,
             width=request.width,
             height=request.height,
-            repair_image_path=repair_image_path,
-            repair_image_bbox=repair_image_bbox,
+            repair_images=repair_images,
             dense_cleanup=dense_cleanup,
             prepared=prepared,
             placements_expected=len(prepared),
@@ -672,19 +667,17 @@ class LayoutPreservingRenderer:
                         cleanup_color,
                         page_height=page_result.height,
                     )
-                elif (
-                    page_result.repair_image_path
-                    and page_result.repair_image_bbox
-                ):
-                    x0, y0, x1, y1 = page_result.repair_image_bbox
-                    overlay.drawImage(
-                        page_result.repair_image_path,
-                        x0,
-                        page_result.height - y1,
-                        x1 - x0,
-                        y1 - y0,
-                        mask="auto",
-                    )
+                else:
+                    for repair_image in page_result.repair_images:
+                        x0, y0, x1, y1 = repair_image.bbox
+                        overlay.drawImage(
+                            repair_image.path,
+                            x0,
+                            page_result.height - y1,
+                            x1 - x0,
+                            y1 - y0,
+                            mask="auto",
+                        )
 
                 for item in page_result.prepared:
                     if len(item.fragments) > 1:
@@ -719,7 +712,17 @@ class LayoutPreservingRenderer:
         writer = PdfWriter()
         for overlay_index, source_page in enumerate(selected_source_pages):
             writer.add_page(source_page)
-            writer.pages[-1].merge_page(overlay_reader.pages[overlay_index])
+            output_page = writer.pages[-1]
+            output_page.merge_page(overlay_reader.pages[overlay_index])
+            merged_content = output_page.get_contents()
+            if merged_content is not None:
+                # pypdf's convenience method can leave the original
+                # /Contents array untouched after merge_page(). Replacing it
+                # explicitly guarantees that the combined source and overlay
+                # operators are stored as one Flate-compressed stream.
+                output_page.replace_contents(
+                    merged_content.flate_encode(level=9)
+                )
         writer.add_metadata(
             {
                 "/Title": f"{task.source_filename} - 原版面中文版",
@@ -745,8 +748,13 @@ class LayoutPreservingRenderer:
             "render_dpi": self.render_dpi,
             "render_workers": render_workers,
             "render_backend": render_backend,
+            "content_stream_compression": "flate-level-9",
+            "repair_image_encoding": "binary-flate-rgba-tiles",
             "repair_image_layers": sum(
-                bool(item.repair_image_path) for item in page_results
+                bool(item.repair_images) for item in page_results
+            ),
+            "repair_image_tiles": sum(
+                len(item.repair_images) for item in page_results
             ),
             "source_pages": task.page_count,
             "source_page_numbers": page_numbers,
@@ -1001,6 +1009,168 @@ class LayoutPreservingRenderer:
         else:
             mode = "inpaint-complex" if spread > 20.0 else "inpaint"
         return mode, (px0, py0, px1, py1), patch
+
+    def _write_repair_tiles(
+        self,
+        patches: list[tuple[tuple[int, int, int, int], np.ndarray]],
+        temp_dir: Path,
+        selected_index: int,
+        scale_x: float,
+        scale_y: float,
+    ) -> list[_RepairImage]:
+        if not patches:
+            return []
+
+        gap = max(6, int(round(self.render_dpi * 0.08)))
+        groups = self._cluster_repair_patches(
+            patches,
+            gap=gap,
+            maximum_groups=MAX_REPAIR_TILES_PER_PAGE,
+        )
+        repair_images: list[_RepairImage] = []
+        for tile_index, (tile_bbox, tile_patches) in enumerate(
+            groups, start=1
+        ):
+            left, top, right, bottom = tile_bbox
+            tile = Image.new(
+                "RGBA",
+                (right - left, bottom - top),
+                (0, 0, 0, 0),
+            )
+            for patch_bbox, patch in tile_patches:
+                tile.alpha_composite(
+                    Image.fromarray(patch, mode="RGBA"),
+                    dest=(patch_bbox[0] - left, patch_bbox[1] - top),
+                )
+
+            alpha_bbox = tile.getbbox()
+            if alpha_bbox is None:
+                continue
+            crop_left, crop_top, crop_right, crop_bottom = alpha_bbox
+            tile = tile.crop(alpha_bbox)
+            absolute_bbox = (
+                left + crop_left,
+                top + crop_top,
+                left + crop_right,
+                top + crop_bottom,
+            )
+            repair_path = temp_dir / (
+                f"repair-page-{selected_index:06d}"
+                f"-tile-{tile_index:03d}.png"
+            )
+            tile.save(
+                repair_path,
+                format="PNG",
+                optimize=True,
+                compress_level=9,
+            )
+            repair_images.append(
+                _RepairImage(
+                    path=str(repair_path),
+                    bbox=[
+                        absolute_bbox[0] / scale_x,
+                        absolute_bbox[1] / scale_y,
+                        absolute_bbox[2] / scale_x,
+                        absolute_bbox[3] / scale_y,
+                    ],
+                )
+            )
+        return repair_images
+
+    @classmethod
+    def _cluster_repair_patches(
+        cls,
+        patches: list[tuple[tuple[int, int, int, int], np.ndarray]],
+        gap: int,
+        maximum_groups: int,
+    ) -> list[
+        tuple[
+            tuple[int, int, int, int],
+            list[tuple[tuple[int, int, int, int], np.ndarray]],
+        ]
+    ]:
+        groups = [(bbox, [(bbox, patch)]) for bbox, patch in patches]
+        changed = True
+        while changed:
+            changed = False
+            merged = []
+            while groups:
+                bbox, items = groups.pop(0)
+                match_indexes = [
+                    index
+                    for index, (candidate_bbox, _) in enumerate(groups)
+                    if cls._repair_boxes_are_close(
+                        bbox, candidate_bbox, gap
+                    )
+                ]
+                if match_indexes:
+                    for index in reversed(match_indexes):
+                        candidate_bbox, candidate_items = groups.pop(index)
+                        bbox = cls._union_pixel_boxes(bbox, candidate_bbox)
+                        items.extend(candidate_items)
+                    groups.insert(0, (bbox, items))
+                    changed = True
+                else:
+                    merged.append((bbox, items))
+            groups = merged
+
+        while len(groups) > maximum_groups:
+            best_pair: tuple[int, int] | None = None
+            best_cost: int | None = None
+            for left_index in range(len(groups) - 1):
+                left_bbox = groups[left_index][0]
+                for right_index in range(left_index + 1, len(groups)):
+                    right_bbox = groups[right_index][0]
+                    union = cls._union_pixel_boxes(left_bbox, right_bbox)
+                    cost = (
+                        cls._pixel_box_area(union)
+                        - cls._pixel_box_area(left_bbox)
+                        - cls._pixel_box_area(right_bbox)
+                    )
+                    if best_cost is None or cost < best_cost:
+                        best_cost = cost
+                        best_pair = (left_index, right_index)
+            if best_pair is None:
+                break
+            left_index, right_index = best_pair
+            left_bbox, left_items = groups[left_index]
+            right_bbox, right_items = groups[right_index]
+            groups[left_index] = (
+                cls._union_pixel_boxes(left_bbox, right_bbox),
+                left_items + right_items,
+            )
+            groups.pop(right_index)
+
+        return sorted(groups, key=lambda item: (item[0][1], item[0][0]))
+
+    @staticmethod
+    def _repair_boxes_are_close(
+        left: tuple[int, int, int, int],
+        right: tuple[int, int, int, int],
+        gap: int,
+    ) -> bool:
+        return not (
+            left[2] + gap < right[0]
+            or right[2] + gap < left[0]
+            or left[3] + gap < right[1]
+            or right[3] + gap < left[1]
+        )
+
+    @staticmethod
+    def _union_pixel_boxes(
+        left: tuple[int, int, int, int],
+        right: tuple[int, int, int, int],
+    ) -> tuple[int, int, int, int]:
+        return (
+            min(left[0], right[0]),
+            min(left[1], right[1]),
+            max(left[2], right[2]),
+            max(left[3], right[3]),
+        )
+
+    @staticmethod
+    def _pixel_box_area(box: tuple[int, int, int, int]) -> int:
+        return max(box[2] - box[0], 0) * max(box[3] - box[1], 0)
 
     @staticmethod
     def _erase_padding(segment: Segment, height: float) -> tuple[float, float]:

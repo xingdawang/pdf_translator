@@ -467,7 +467,7 @@ class TranslationWorkflow:
         source_layout: bool = False,
         show_segment_ids: bool = False,
         font_path: str | Path | None = None,
-        layout_dpi: int = 200,
+        layout_dpi: int = 170,
         progress: ProgressCallback | None = None,
     ) -> tuple[TranslationTask, RenderOutputs]:
         task, report = self.validate(task_id)

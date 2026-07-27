@@ -62,6 +62,10 @@ def test_index_renders_lightweight_local_ui(tmp_path):
     assert 'name="page_end"' in response.get_data(as_text=True)
     assert '<option value="vision" selected>' in response.get_data(as_text=True)
     assert "自动识别（推荐）" in response.get_data(as_text=True)
+    assert '<option value="170" selected>170 DPI · 推荐</option>' in response.get_data(
+        as_text=True
+    )
+    assert "150 DPI" not in response.get_data(as_text=True)
     assert "翻译范围与术语" not in response.get_data(as_text=True)
     assert 'name="protected_terms"' not in response.get_data(as_text=True)
 
@@ -187,9 +191,10 @@ def test_task_page_uses_simplified_four_step_workflow(tmp_path):
     assert "保存修改并重新检查" not in content
     assert "确认无误" not in content
     assert "选择 Google 下载的 XLSX" in content
-    assert "快速预览 · 170 DPI" in content
-    assert "正式输出 · 200 DPI（推荐）" in content
+    assert "正式输出 · 170 DPI（推荐）" in content
+    assert "高清输出 · 200 DPI" in content
     assert "精细输出 · 240 DPI（小字/复杂背景）" in content
+    assert "150 DPI" not in content
     assert "不影响 OCR 识别或中文矢量文字清晰度" in content
     assert "自动使用当前机器的全部" in content
     assert content.count('name="output_mode"') == 2
